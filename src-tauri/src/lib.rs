@@ -1,6 +1,7 @@
 mod ammeter;
 mod flight_controller;
 mod mcp_server;
+pub mod motor_test;
 mod parameter_file;
 mod status;
 
@@ -58,6 +59,17 @@ fn request_flight_controller_parameters(
 }
 
 #[tauri::command]
+async fn read_flight_controller_parameter(
+    manager: State<'_, Arc<ControllerManager>>,
+    name: String,
+) -> Result<flight_controller::ParameterValue, String> {
+    let manager = Arc::clone(manager.inner());
+    tauri::async_runtime::spawn_blocking(move || manager.read_parameter(name))
+        .await
+        .map_err(|error| format!("Задача чтения параметра завершилась с ошибкой: {error}"))?
+}
+
+#[tauri::command]
 fn save_mission_planner_parameter_file(
     path: String,
     entries: Vec<ParameterFileEntry>,
@@ -71,11 +83,50 @@ fn load_mission_planner_parameter_file(path: String) -> Result<Vec<ParameterFile
 }
 
 #[tauri::command]
+fn save_scenario_file(path: String, contents: String) -> Result<(), String> {
+    std::fs::write(&path, contents)
+        .map_err(|error| format!("Не удалось сохранить сценарии в {path}: {error}"))
+}
+
+#[tauri::command]
+fn load_scenario_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path)
+        .map_err(|error| format!("Не удалось прочитать сценарии из {path}: {error}"))
+}
+
+#[tauri::command]
 fn write_flight_controller_parameters(
     manager: State<'_, Arc<ControllerManager>>,
     requests: Vec<ParameterWriteRequest>,
 ) -> Result<(), String> {
     manager.write_parameters(requests)
+}
+
+#[tauri::command]
+fn start_motor_rotation(
+    manager: State<'_, Arc<ControllerManager>>,
+    throttle_percent: f32,
+    duration_seconds: f32,
+) -> Result<(), String> {
+    if !throttle_percent.is_finite() || !(1.0..=30.0).contains(&throttle_percent) {
+        return Err("Для проверки вращения разрешён газ от 1 до 30%".to_owned());
+    }
+    if !duration_seconds.is_finite() || !(0.1..=5.0).contains(&duration_seconds) {
+        return Err("Проверка вращения должна длиться от 0.1 до 5 секунд".to_owned());
+    }
+    let minimum_pwm = 1_000_u16;
+    let pwm = minimum_pwm + (throttle_percent * 10.0).round() as u16;
+    manager.start_rc_pulse(
+        1,
+        pwm,
+        minimum_pwm,
+        std::time::Duration::from_secs_f32(duration_seconds),
+    )
+}
+
+#[tauri::command]
+fn emergency_stop_motor(manager: State<'_, Arc<ControllerManager>>) -> Result<(), String> {
+    manager.emergency_stop()
 }
 
 #[tauri::command]
@@ -120,6 +171,7 @@ fn stop_mcp_server(manager: State<'_, Arc<McpManager>>) -> McpStatus {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let controller = Arc::new(ControllerManager::default());
+    let controller_on_window_event = Arc::clone(&controller);
     let ammeter = Arc::new(AmmeterManager::default());
     let mcp = Arc::new(McpManager::new(
         Arc::clone(&controller),
@@ -136,15 +188,28 @@ pub fn run() {
             connect_flight_controller,
             disconnect_flight_controller,
             request_flight_controller_parameters,
+            read_flight_controller_parameter,
             save_mission_planner_parameter_file,
             load_mission_planner_parameter_file,
+            save_scenario_file,
+            load_scenario_file,
             write_flight_controller_parameters,
+            start_motor_rotation,
+            emergency_stop_motor,
             connect_ammeter,
             disconnect_ammeter,
             get_mcp_status,
             start_mcp_server,
             stop_mcp_server
         ])
+        .on_window_event(move |_window, event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) {
+                let _ = controller_on_window_event.emergency_stop();
+            }
+        })
         .run(tauri::generate_context!())
         .expect("failed to run UAV Test Station");
 }

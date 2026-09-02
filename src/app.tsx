@@ -12,6 +12,7 @@ import {
   type ParameterValue,
   type ParameterWriteStatus,
 } from "./parameter-utils";
+import { ScenarioEditor } from "./scenario-editor";
 
 type Tab = {
   id: string;
@@ -174,7 +175,6 @@ export function App() {
   const [mcpPublicAddress, setMcpPublicAddress] = useState(
     "https://YOUR-TUNNEL-DOMAIN.ngrok-free.app",
   );
-
   const scanPorts = () => {
     if (!isTauriRuntime) {
       setIsScanning(false);
@@ -279,7 +279,8 @@ export function App() {
   }, [heartbeat?.portName, ports, ammeter]);
 
   useEffect(() => {
-    if (!isTauriRuntime || !heartbeat || activeTab !== "parameters") return;
+    if (!isTauriRuntime || !heartbeat || (activeTab !== "parameters" && activeTab !== "scenarios"))
+      return;
     setParameterError(null);
     invoke("request_flight_controller_parameters").catch((error: unknown) => {
       setParameterError(String(error));
@@ -1226,7 +1227,22 @@ export function App() {
           </>
         )}
 
-        {!["connections", "telemetry", "parameters", "mcp"].includes(activeTab) && (
+        {activeTab === "scenarios" && (
+          <ScenarioEditor
+            context={{
+              controllerConnected: heartbeat !== null,
+              controllerName: heartbeat
+                ? `${heartbeat.vehicleType}, ${heartbeat.autopilot}`
+                : undefined,
+              armed: telemetry?.armed,
+              ammeterConnected: ammeter !== null,
+              ammeterCurrentA: ammeter?.currentAmps,
+              parameters: parameters?.items ?? [],
+            }}
+          />
+        )}
+
+        {!["connections", "telemetry", "parameters", "mcp", "scenarios"].includes(activeTab) && (
           <section class="hero">
             <p class="eyebrow">Следующий этап</p>
             <h1>{tabs.find((tab) => tab.id === activeTab)?.label}</h1>

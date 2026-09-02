@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use mavlink::MavHeader;
 use mavlink::dialects::ardupilotmega::{
     COMMAND_LONG_DATA, MavAutopilot, MavCmd, MavMessage, MavModeFlag, MavParamType,
-    PARAM_REQUEST_LIST_DATA, PARAM_SET_DATA,
+    PARAM_REQUEST_LIST_DATA, PARAM_REQUEST_READ_DATA, PARAM_SET_DATA, RC_CHANNELS_OVERRIDE_DATA,
 };
+use mavlink::error::MessageReadError;
 use mavlink::peek_reader::PeekReader;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -181,7 +182,35 @@ pub struct ParameterWriteStatus {
 
 enum WorkerCommand {
     RequestParameters,
+    ReadParameter {
+        name: String,
+        reply: mpsc::SyncSender<Result<ParameterValue, String>>,
+    },
     WriteParameters(Vec<ParameterWriteRequest>),
+    StartRcPulse {
+        channel: u8,
+        pwm: u16,
+        minimum_pwm: u16,
+        duration: Duration,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    EmergencyStop {
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+}
+
+struct ActiveRcPulse {
+    channel: u8,
+    pwm: u16,
+    minimum_pwm: u16,
+    deadline: Instant,
+    last_sent: Instant,
+}
+
+struct PendingParameterRead {
+    name: String,
+    reply: mpsc::SyncSender<Result<ParameterValue, String>>,
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -307,6 +336,31 @@ impl ControllerManager {
             .map_err(|_| "Сессия контроллера уже завершена".to_owned())
     }
 
+    pub fn read_parameter(&self, name: String) -> Result<ParameterValue, String> {
+        let name = name.trim().to_owned();
+        if name.is_empty() || name.len() > 16 || !name.is_ascii() {
+            return Err(
+                "Имя MAVLink-параметра должно содержать от 1 до 16 ASCII-символов".to_owned(),
+            );
+        }
+        let (reply, response) = mpsc::sync_channel(1);
+        {
+            let session = self.session.lock();
+            session
+                .as_ref()
+                .ok_or_else(|| "Полётный контроллер не подключён".to_owned())?
+                .commands
+                .send(WorkerCommand::ReadParameter {
+                    name: name.clone(),
+                    reply,
+                })
+                .map_err(|_| "Сессия контроллера уже завершена".to_owned())?;
+        }
+        response
+            .recv_timeout(Duration::from_secs(4))
+            .map_err(|_| format!("Контроллер не ответил на запрос параметра {name}"))?
+    }
+
     pub fn write_parameters(&self, requests: Vec<ParameterWriteRequest>) -> Result<(), String> {
         if requests.is_empty() || requests.len() > 200 {
             return Err("Выберите от 1 до 200 параметров".to_owned());
@@ -333,6 +387,59 @@ impl ControllerManager {
             .commands
             .send(WorkerCommand::WriteParameters(requests))
             .map_err(|_| "Сессия контроллера уже завершена".to_owned())
+    }
+
+    pub fn start_rc_pulse(
+        &self,
+        channel: u8,
+        pwm: u16,
+        minimum_pwm: u16,
+        duration: Duration,
+    ) -> Result<(), String> {
+        if !(1..=8).contains(&channel) {
+            return Err("Канал газа должен быть от 1 до 8".to_owned());
+        }
+        if !(800..=2200).contains(&pwm) || !(800..=2200).contains(&minimum_pwm) {
+            return Err("PWM должен находиться в диапазоне 800…2200".to_owned());
+        }
+        if pwm <= minimum_pwm {
+            return Err("Рабочий PWM должен быть выше минимального".to_owned());
+        }
+        if duration.is_zero() || duration > Duration::from_secs(5) {
+            return Err("Импульс газа должен длиться от 0 до 5 секунд".to_owned());
+        }
+        let (reply, response) = mpsc::sync_channel(1);
+        self.session
+            .lock()
+            .as_ref()
+            .ok_or_else(|| "Полётный контроллер не подключён".to_owned())?
+            .commands
+            .send(WorkerCommand::StartRcPulse {
+                channel,
+                pwm,
+                minimum_pwm,
+                duration,
+                reply,
+            })
+            .map_err(|_| "Сессия контроллера уже завершена".to_owned())?;
+        response
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| "Контроллер не подтвердил отправку команды газа".to_owned())?
+    }
+
+    pub fn emergency_stop(&self) -> Result<(), String> {
+        let (reply, response) = mpsc::sync_channel(1);
+        let session = self.session.lock();
+        let Some(session) = session.as_ref() else {
+            return Ok(());
+        };
+        session
+            .commands
+            .send(WorkerCommand::EmergencyStop { reply })
+            .map_err(|_| "Сессия контроллера уже завершена".to_owned())?;
+        response
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| "Не получено подтверждение аварийной остановки".to_owned())?
     }
 }
 
@@ -433,6 +540,8 @@ fn run_session(
     let mut write_queue = VecDeque::<ParameterWriteRequest>::new();
     let mut awaiting_write: Option<(ParameterWriteRequest, Instant, u8)> = None;
     let mut target = None;
+    let mut pending_parameter_read: Option<PendingParameterRead> = None;
+    let mut active_rc_pulse: Option<ActiveRcPulse> = None;
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(command) = commands.try_recv() {
@@ -451,6 +560,33 @@ fn run_session(
                         );
                     }
                 }
+                WorkerCommand::ReadParameter { name, reply } => {
+                    if pending_parameter_read.is_some() {
+                        let _ =
+                            reply.send(Err("Уже выполняется чтение другого параметра".to_owned()));
+                    } else if let Some((target_system, target_component)) = target {
+                        match request_parameter(
+                            &mut writer,
+                            target_system,
+                            target_component,
+                            &name,
+                            &mut outbound_sequence,
+                        ) {
+                            Ok(()) => {
+                                pending_parameter_read = Some(PendingParameterRead {
+                                    name,
+                                    reply,
+                                    started_at: Instant::now(),
+                                })
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
+                    } else {
+                        let _ = reply.send(Err("Целевой контроллер ещё не определён".to_owned()));
+                    }
+                }
                 WorkerCommand::WriteParameters(requests) => {
                     write_queue = requests.into();
                     awaiting_write = None;
@@ -460,6 +596,77 @@ fn run_session(
                         ..ParameterWriteStatus::default()
                     };
                 }
+                WorkerCommand::StartRcPulse {
+                    channel,
+                    pwm,
+                    minimum_pwm,
+                    duration,
+                    reply,
+                } => {
+                    let result = target
+                        .ok_or_else(|| "Целевой контроллер ещё не определён".to_owned())
+                        .and_then(|target| {
+                            send_rc_override(
+                                &mut writer,
+                                target,
+                                channel,
+                                pwm,
+                                &mut outbound_sequence,
+                            )
+                        });
+                    if result.is_ok() {
+                        active_rc_pulse = Some(ActiveRcPulse {
+                            channel,
+                            pwm,
+                            minimum_pwm,
+                            deadline: Instant::now() + duration,
+                            last_sent: Instant::now(),
+                        });
+                    }
+                    let _ = reply.send(result);
+                }
+                WorkerCommand::EmergencyStop { reply } => {
+                    let result = stop_rc_override(
+                        &mut writer,
+                        target,
+                        active_rc_pulse.take(),
+                        &mut outbound_sequence,
+                    );
+                    let _ = reply.send(result);
+                }
+            }
+        }
+
+        if active_rc_pulse
+            .as_ref()
+            .is_some_and(|pulse| Instant::now() >= pulse.deadline)
+        {
+            let _ = stop_rc_override(
+                &mut writer,
+                target,
+                active_rc_pulse.take(),
+                &mut outbound_sequence,
+            );
+        } else if let (Some(target), Some(pulse)) = (target, active_rc_pulse.as_mut())
+            && pulse.last_sent.elapsed() >= Duration::from_millis(250)
+        {
+            if send_rc_override(
+                &mut writer,
+                target,
+                pulse.channel,
+                pulse.pwm,
+                &mut outbound_sequence,
+            )
+            .is_err()
+            {
+                let _ = stop_rc_override(
+                    &mut writer,
+                    Some(target),
+                    active_rc_pulse.take(),
+                    &mut outbound_sequence,
+                );
+            } else {
+                pulse.last_sent = Instant::now();
             }
         }
 
@@ -492,6 +699,13 @@ fn run_session(
                         .as_ref()
                         .is_some_and(|(request, _, _)| request.name == parameter_name);
                     let parameter = upsert_parameter_by_name(&mut parameters, parameter);
+                    if pending_parameter_read
+                        .as_ref()
+                        .is_some_and(|pending| pending.name == parameter_name)
+                        && let Some(pending) = pending_parameter_read.take()
+                    {
+                        let _ = pending.reply.send(Ok(parameter.clone()));
+                    }
                     if write_confirmed {
                         awaiting_write = None;
                         let mut status = parameter_write_status.lock();
@@ -557,12 +771,11 @@ fn run_session(
                     };
                     last_heartbeat = Some(Instant::now());
                     target = Some((header.system_id, header.component_id));
-                    eprintln!(
-                        "MAVLink heartbeat on {port_name}: {}:{}",
-                        header.system_id, header.component_id
-                    );
-
                     if let Some(sender) = first_heartbeat_tx.take() {
+                        eprintln!(
+                            "MAVLink connected on {port_name}: system={}, component={}",
+                            header.system_id, header.component_id
+                        );
                         let _ = sender.send(Ok(info.clone()));
                     }
 
@@ -596,6 +809,11 @@ fn run_session(
                     last_telemetry_emit = Instant::now();
                 }
             }
+            Err(MessageReadError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut => {
+                // A short serial timeout is expected while no complete MAVLink
+                // packet is available. The loop must wake up periodically to
+                // process commands and detect a lost heartbeat.
+            }
             Err(error) => {
                 read_error_count += 1;
                 if read_error_count <= 3 {
@@ -614,6 +832,17 @@ fn run_session(
                 },
             );
             last_emitted_write_status = current_write_status;
+        }
+
+        if pending_parameter_read
+            .as_ref()
+            .is_some_and(|pending| pending.started_at.elapsed() >= Duration::from_secs(3))
+            && let Some(pending) = pending_parameter_read.take()
+        {
+            let _ = pending.reply.send(Err(format!(
+                "Контроллер не ответил на запрос параметра {}",
+                pending.name
+            )));
         }
 
         if first_heartbeat_tx.is_some() && started_at.elapsed() >= HEARTBEAT_TIMEOUT {
@@ -639,6 +868,13 @@ fn run_session(
             break;
         }
     }
+
+    let _ = stop_rc_override(
+        &mut writer,
+        target,
+        active_rc_pulse.take(),
+        &mut outbound_sequence,
+    );
 
     if stop.load(Ordering::Relaxed) {
         let _ = app.emit(
@@ -686,6 +922,30 @@ fn request_parameter_list(
     };
     mavlink::write_v2_msg(writer, header, &request)
         .map_err(|error| format!("Не удалось отправить PARAM_REQUEST_LIST: {error}"))?;
+    *sequence = sequence.wrapping_add(1);
+    Ok(())
+}
+
+fn request_parameter(
+    writer: &mut Box<dyn serialport::SerialPort>,
+    target_system: u8,
+    target_component: u8,
+    name: &str,
+    sequence: &mut u8,
+) -> Result<(), String> {
+    let request = MavMessage::PARAM_REQUEST_READ(PARAM_REQUEST_READ_DATA {
+        param_index: -1,
+        target_system,
+        target_component,
+        param_id: name.into(),
+    });
+    let header = MavHeader {
+        system_id: 255,
+        component_id: 190,
+        sequence: *sequence,
+    };
+    mavlink::write_v2_msg(writer, header, &request)
+        .map_err(|error| format!("Не удалось запросить параметр {name}: {error}"))?;
     *sequence = sequence.wrapping_add(1);
     Ok(())
 }
@@ -838,6 +1098,53 @@ fn request_telemetry_messages(
 
     eprintln!("Requested MAVLink telemetry messages on {port_name}");
     true
+}
+
+fn send_rc_override(
+    writer: &mut Box<dyn serialport::SerialPort>,
+    target: (u8, u8),
+    channel: u8,
+    value: u16,
+    sequence: &mut u8,
+) -> Result<(), String> {
+    let mut channels = [u16::MAX; 8];
+    channels[usize::from(channel - 1)] = value;
+    let message = MavMessage::RC_CHANNELS_OVERRIDE(RC_CHANNELS_OVERRIDE_DATA {
+        target_system: target.0,
+        target_component: target.1,
+        chan1_raw: channels[0],
+        chan2_raw: channels[1],
+        chan3_raw: channels[2],
+        chan4_raw: channels[3],
+        chan5_raw: channels[4],
+        chan6_raw: channels[5],
+        chan7_raw: channels[6],
+        chan8_raw: channels[7],
+    });
+    let header = MavHeader {
+        system_id: 255,
+        component_id: 190,
+        sequence: *sequence,
+    };
+    mavlink::write_v2_msg(writer, header, &message)
+        .map_err(|error| format!("Не удалось отправить RC override: {error}"))?;
+    *sequence = sequence.wrapping_add(1);
+    Ok(())
+}
+
+fn stop_rc_override(
+    writer: &mut Box<dyn serialport::SerialPort>,
+    target: Option<(u8, u8)>,
+    pulse: Option<ActiveRcPulse>,
+    sequence: &mut u8,
+) -> Result<(), String> {
+    let (Some(target), Some(pulse)) = (target, pulse) else {
+        return Ok(());
+    };
+    for _ in 0..3 {
+        send_rc_override(writer, target, pulse.channel, pulse.minimum_pwm, sequence)?;
+    }
+    send_rc_override(writer, target, pulse.channel, 0, sequence)
 }
 
 fn update_telemetry(snapshot: &mut TelemetrySnapshot, message: &MavMessage) {
