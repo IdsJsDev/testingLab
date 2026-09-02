@@ -42,6 +42,10 @@ pub struct AmmeterManager {
 }
 
 impl AmmeterManager {
+    pub fn snapshot(&self) -> Option<AmmeterSnapshot> {
+        self.latest.lock().clone()
+    }
+
     pub fn connect(&self, app: AppHandle, port_name: String) -> Result<AmmeterSnapshot, String> {
         self.disconnect();
         let stop = Arc::new(AtomicBool::new(false));

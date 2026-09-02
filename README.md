@@ -38,3 +38,6 @@ Frontend находится в `src/`, нативная часть и Tauri-ко
 - [Технологический стек и сборка](docs/07-technology-stack.md)
 - [Подключения и управляющий канал](docs/08-connectivity-and-control.md)
 - [Пошаговый план разработки](docs/09-development-plan.md)
+- [Управление параметрами](docs/10-parameter-management.md)
+- [Подключение амперметра](docs/11-ammeter-connection.md)
+- [Локальный MCP-сервер](docs/12-local-mcp-server.md)

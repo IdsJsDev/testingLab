@@ -75,6 +75,26 @@ type AmmeterSnapshot = {
 type AmmeterEvent =
   { kind: "measurement"; snapshot: AmmeterSnapshot } | { kind: "disconnected"; reason: string };
 
+type McpStatus = {
+  running: boolean;
+  address: string;
+  accessMode: "local" | "public";
+  publicAddress?: string;
+  token: string;
+  clients: Array<{
+    name: string;
+    sessionId?: string;
+    lastSeenUnixMs: number;
+    requestCount: number;
+  }>;
+  log: Array<{
+    timestampUnixMs: number;
+    client: string;
+    action: string;
+    accepted: boolean;
+  }>;
+};
+
 type ParameterSnapshot = {
   items: ParameterValue[];
   receivedCount: number;
@@ -145,6 +165,15 @@ export function App() {
   const wasWriting = useRef(false);
   const [editingParameter, setEditingParameter] = useState<string | null>(null);
   const [editingValue, setEditingValue] = useState("");
+  const [mcpStatus, setMcpStatus] = useState<McpStatus | null>(null);
+  const [mcpError, setMcpError] = useState<string | null>(null);
+  const [isChangingMcp, setIsChangingMcp] = useState(false);
+  const [showMcpToken, setShowMcpToken] = useState(false);
+  const [mcpCopied, setMcpCopied] = useState(false);
+  const [mcpAccessMode, setMcpAccessMode] = useState<"local" | "public">("local");
+  const [mcpPublicAddress, setMcpPublicAddress] = useState(
+    "https://YOUR-TUNNEL-DOMAIN.ngrok-free.app",
+  );
 
   const scanPorts = () => {
     if (!isTauriRuntime) {
@@ -183,6 +212,7 @@ export function App() {
 
     let unlisten: UnlistenFn | undefined;
     let unlistenAmmeter: UnlistenFn | undefined;
+    let unlistenMcp: UnlistenFn | undefined;
     listen<ControllerEvent>("flight-controller-event", ({ payload }) => {
       if (payload.kind === "heartbeat") {
         setHeartbeat(payload.heartbeat);
@@ -222,11 +252,24 @@ export function App() {
     }).then((stopListening) => {
       unlistenAmmeter = stopListening;
     });
+    listen<McpStatus>("mcp-status", ({ payload }) => setMcpStatus(payload)).then(
+      (stopListening) => {
+        unlistenMcp = stopListening;
+      },
+    );
 
     scanPorts();
+    invoke<McpStatus>("get_mcp_status")
+      .then((status) => {
+        setMcpStatus(status);
+        setMcpAccessMode(status.accessMode);
+        if (status.publicAddress) setMcpPublicAddress(status.publicAddress);
+      })
+      .catch(() => undefined);
     return () => {
       unlisten?.();
       unlistenAmmeter?.();
+      unlistenMcp?.();
     };
   }, []);
 
@@ -290,6 +333,51 @@ export function App() {
       });
   };
 
+  const setMcpServerRunning = async (running: boolean) => {
+    setIsChangingMcp(true);
+    setMcpError(null);
+    try {
+      const status = await invoke<McpStatus>(running ? "start_mcp_server" : "stop_mcp_server", {
+        publicAddress: running && mcpAccessMode === "public" ? mcpPublicAddress : null,
+      });
+      setMcpStatus(status);
+    } catch (error) {
+      setMcpError(String(error));
+    } finally {
+      setIsChangingMcp(false);
+    }
+  };
+
+  const selectedMcpAddress =
+    mcpAccessMode === "public"
+      ? `${mcpPublicAddress.trim().replace(/\/(mcp)?\/?$/, "")}/mcp`
+      : "http://127.0.0.1:8765/mcp";
+  const mcpConfiguration = mcpStatus
+    ? JSON.stringify(
+        {
+          mcpServers: {
+            "uav-test-station": {
+              type: "http",
+              url: selectedMcpAddress,
+              headers: { Authorization: `Bearer ${mcpStatus.token}` },
+            },
+          },
+        },
+        null,
+        2,
+      )
+    : "";
+  const displayedMcpConfiguration =
+    !showMcpToken && mcpStatus
+      ? mcpConfiguration.replace(mcpStatus.token, "<скрытый токен>")
+      : mcpConfiguration;
+
+  const copyMcpConfiguration = async () => {
+    await navigator.clipboard.writeText(mcpConfiguration);
+    setMcpCopied(true);
+    window.setTimeout(() => setMcpCopied(false), 1500);
+  };
+
   const hasAnyConnection = heartbeat !== null || ammeter !== null;
   const tabs: Tab[] = [
     { id: "connections", label: "Подключения", available: true },
@@ -317,6 +405,7 @@ export function App() {
       available: heartbeat !== null,
       unavailableReason: "Требуется подключение полётного контроллера",
     },
+    { id: "mcp", label: "MCP", available: true },
     { id: "scenarios", label: "Сценарии", available: true },
     { id: "results", label: "Результаты", available: true },
   ];
@@ -982,7 +1071,162 @@ export function App() {
           </>
         )}
 
-        {!["connections", "telemetry", "parameters"].includes(activeTab) && (
+        {activeTab === "mcp" && (
+          <>
+            <section class="hero compact-hero mcp-hero">
+              <div>
+                <p class="eyebrow">Доступ для ИИ-моделей</p>
+                <h1>MCP-сервер</h1>
+              </div>
+              <div class={mcpStatus?.running ? "mcp-state running" : "mcp-state"}>
+                <span class="status-dot" />
+                <strong>{mcpStatus?.running ? "Включён" : "Выключен"}</strong>
+              </div>
+            </section>
+            <section class="mcp-grid">
+              <article class="mcp-panel">
+                <div class="mcp-panel-heading">
+                  <div>
+                    <p class="eyebrow">Управление</p>
+                    <h2>Streamable HTTP</h2>
+                  </div>
+                  <button
+                    class={mcpStatus?.running ? "" : "primary-button"}
+                    type="button"
+                    disabled={isChangingMcp}
+                    onClick={() => setMcpServerRunning(!mcpStatus?.running)}
+                  >
+                    {mcpStatus?.running ? "Выключить сервер" : "Включить сервер"}
+                  </button>
+                </div>
+                <div class="mcp-mode-picker" role="group" aria-label="Режим доступа MCP">
+                  <button
+                    type="button"
+                    class={mcpAccessMode === "local" ? "active" : ""}
+                    disabled={mcpStatus?.running}
+                    onClick={() => setMcpAccessMode("local")}
+                  >
+                    Локально
+                  </button>
+                  <button
+                    type="button"
+                    class={mcpAccessMode === "public" ? "active" : ""}
+                    disabled={mcpStatus?.running}
+                    onClick={() => setMcpAccessMode("public")}
+                  >
+                    Через туннель
+                  </button>
+                </div>
+                {mcpAccessMode === "public" && (
+                  <label class="mcp-public-address">
+                    Публичный HTTPS-адрес
+                    <input
+                      type="url"
+                      value={mcpPublicAddress}
+                      disabled={mcpStatus?.running}
+                      onInput={(event) =>
+                        setMcpPublicAddress((event.currentTarget as HTMLInputElement).value)
+                      }
+                    />
+                    <small>
+                      Запустите туннель на локальный порт 8765 и вставьте выданный адрес. Путь
+                      `/mcp` добавится автоматически.
+                    </small>
+                  </label>
+                )}
+                <dl class="mcp-details">
+                  <div>
+                    <dt>Адрес клиента</dt>
+                    <dd>{selectedMcpAddress}</dd>
+                  </div>
+                  <div>
+                    <dt>Доступ</dt>
+                    <dd>Только чтение</dd>
+                  </div>
+                  <div>
+                    <dt>Сеть</dt>
+                    <dd>
+                      {mcpAccessMode === "local"
+                        ? "Только этот компьютер"
+                        : "Публичный HTTPS-туннель"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Токен</dt>
+                    <dd class="mcp-token">
+                      <code>
+                        {showMcpToken ? (mcpStatus?.token ?? "—") : "••••••••••••••••••••••••"}
+                      </code>
+                      <button type="button" onClick={() => setShowMcpToken((shown) => !shown)}>
+                        {showMcpToken ? "Скрыть" : "Показать"}
+                      </button>
+                    </dd>
+                  </div>
+                </dl>
+                {mcpError && <p class="connection-error">{mcpError}</p>}
+              </article>
+              <article class="mcp-panel">
+                <p class="eyebrow">Подключение модели</p>
+                <h2>Конфигурация MCP-клиента</h2>
+                <p>Добавьте конфигурацию в модель или клиент с поддержкой Streamable HTTP MCP.</p>
+                <pre class="mcp-config">
+                  <code>{displayedMcpConfiguration}</code>
+                </pre>
+                <button type="button" disabled={!mcpStatus} onClick={copyMcpConfiguration}>
+                  {mcpCopied ? "Скопировано" : "Копировать конфигурацию"}
+                </button>
+              </article>
+              <article class="mcp-panel mcp-wide">
+                <div class="mcp-panel-heading">
+                  <div>
+                    <p class="eyebrow">Клиенты</p>
+                    <h2>Кто подключён</h2>
+                  </div>
+                  <strong>{mcpStatus?.clients.length ?? 0}</strong>
+                </div>
+                <div class="mcp-list">
+                  {mcpStatus?.clients.length ? (
+                    mcpStatus.clients.map((client) => (
+                      <div key={`${client.name}-${client.sessionId ?? "stateless"}`}>
+                        <strong>{client.name}</strong>
+                        <span>
+                          {client.sessionId ? `Сессия ${client.sessionId}` : "Без ID сессии"}
+                        </span>
+                        <span>{client.requestCount} запросов</span>
+                        <time>{new Date(client.lastSeenUnixMs).toLocaleTimeString()}</time>
+                      </div>
+                    ))
+                  ) : (
+                    <p>Подключённых клиентов пока нет.</p>
+                  )}
+                </div>
+              </article>
+              <article class="mcp-panel mcp-wide">
+                <p class="eyebrow">Audit log</p>
+                <h2>Последние обращения</h2>
+                <div class="mcp-log">
+                  {mcpStatus?.log.length ? (
+                    mcpStatus.log.map((entry, index) => (
+                      <div
+                        key={`${entry.timestampUnixMs}-${index}`}
+                        class={entry.accepted ? "" : "rejected"}
+                      >
+                        <time>{new Date(entry.timestampUnixMs).toLocaleTimeString()}</time>
+                        <strong>{entry.action}</strong>
+                        <span>{entry.client}</span>
+                        <span>{entry.accepted ? "Разрешено" : "Отклонено"}</span>
+                      </div>
+                    ))
+                  ) : (
+                    <p>Запросов пока нет.</p>
+                  )}
+                </div>
+              </article>
+            </section>
+          </>
+        )}
+
+        {!["connections", "telemetry", "parameters", "mcp"].includes(activeTab) && (
           <section class="hero">
             <p class="eyebrow">Следующий этап</p>
             <h1>{tabs.find((tab) => tab.id === activeTab)?.label}</h1>

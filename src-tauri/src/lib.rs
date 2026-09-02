@@ -1,5 +1,6 @@
 mod ammeter;
 mod flight_controller;
+mod mcp_server;
 mod parameter_file;
 mod status;
 
@@ -9,6 +10,7 @@ use ammeter::{AmmeterManager, AmmeterSnapshot};
 use flight_controller::{
     ControllerManager, HeartbeatInfo, ParameterWriteRequest, SerialPortDescriptor,
 };
+use mcp_server::{McpManager, McpStatus};
 use parameter_file::ParameterFileEntry;
 use status::CoreStatus;
 use tauri::{AppHandle, State};
@@ -96,12 +98,38 @@ async fn disconnect_ammeter(manager: State<'_, Arc<AmmeterManager>>) -> Result<(
         .map_err(|error| format!("Задача отключения завершилась с ошибкой: {error}"))
 }
 
+#[tauri::command]
+fn get_mcp_status(manager: State<'_, Arc<McpManager>>) -> McpStatus {
+    manager.status()
+}
+
+#[tauri::command]
+async fn start_mcp_server(
+    app: AppHandle,
+    manager: State<'_, Arc<McpManager>>,
+    public_address: Option<String>,
+) -> Result<McpStatus, String> {
+    Arc::clone(manager.inner()).start(app, public_address).await
+}
+
+#[tauri::command]
+fn stop_mcp_server(manager: State<'_, Arc<McpManager>>) -> McpStatus {
+    manager.stop()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let controller = Arc::new(ControllerManager::default());
+    let ammeter = Arc::new(AmmeterManager::default());
+    let mcp = Arc::new(McpManager::new(
+        Arc::clone(&controller),
+        Arc::clone(&ammeter),
+    ));
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(Arc::new(ControllerManager::default()))
-        .manage(Arc::new(AmmeterManager::default()))
+        .manage(controller)
+        .manage(ammeter)
+        .manage(mcp)
         .invoke_handler(tauri::generate_handler![
             get_core_status,
             scan_serial_ports,
@@ -112,7 +140,10 @@ pub fn run() {
             load_mission_planner_parameter_file,
             write_flight_controller_parameters,
             connect_ammeter,
-            disconnect_ammeter
+            disconnect_ammeter,
+            get_mcp_status,
+            start_mcp_server,
+            stop_mcp_server
         ])
         .run(tauri::generate_context!())
         .expect("failed to run UAV Test Station");

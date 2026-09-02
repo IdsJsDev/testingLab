@@ -215,6 +215,18 @@ pub struct ControllerManager {
 }
 
 impl ControllerManager {
+    pub fn is_connected(&self) -> bool {
+        self.session.lock().is_some()
+    }
+
+    pub fn telemetry_snapshot(&self) -> Option<TelemetrySnapshot> {
+        self.latest_telemetry.lock().clone()
+    }
+
+    pub fn parameter_snapshot(&self) -> ParameterSnapshot {
+        self.latest_parameters.lock().clone()
+    }
+
     pub fn connect(
         &self,
         app: AppHandle,
