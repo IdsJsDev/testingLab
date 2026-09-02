@@ -1,0 +1,765 @@
+use std::collections::BTreeMap;
+use std::io::BufReader;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use mavlink::MavHeader;
+use mavlink::dialects::ardupilotmega::{
+    COMMAND_LONG_DATA, MavAutopilot, MavCmd, MavMessage, MavModeFlag, PARAM_REQUEST_LIST_DATA,
+};
+use mavlink::peek_reader::PeekReader;
+use serde::Serialize;
+use serialport::{SerialPortInfo, SerialPortType};
+use tauri::{AppHandle, Emitter};
+
+const READ_TIMEOUT: Duration = Duration::from_millis(200);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+const HEARTBEAT_LOSS_TIMEOUT: Duration = Duration::from_secs(3);
+const TELEMETRY_EMIT_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SerialPortDescriptor {
+    pub name: String,
+    pub kind: &'static str,
+    pub manufacturer: Option<String>,
+    pub product: Option<String>,
+    pub serial_number: Option<String>,
+    pub vendor_id: Option<u16>,
+    pub product_id: Option<u16>,
+}
+
+impl From<SerialPortInfo> for SerialPortDescriptor {
+    fn from(port: SerialPortInfo) -> Self {
+        match port.port_type {
+            SerialPortType::UsbPort(usb) => Self {
+                name: port.port_name,
+                kind: "usb",
+                manufacturer: usb.manufacturer,
+                product: usb.product,
+                serial_number: usb.serial_number,
+                vendor_id: Some(usb.vid),
+                product_id: Some(usb.pid),
+            },
+            SerialPortType::BluetoothPort => Self {
+                name: port.port_name,
+                kind: "bluetooth",
+                manufacturer: None,
+                product: None,
+                serial_number: None,
+                vendor_id: None,
+                product_id: None,
+            },
+            SerialPortType::PciPort => Self {
+                name: port.port_name,
+                kind: "pci",
+                manufacturer: None,
+                product: None,
+                serial_number: None,
+                vendor_id: None,
+                product_id: None,
+            },
+            SerialPortType::Unknown => Self {
+                name: port.port_name,
+                kind: "unknown",
+                manufacturer: None,
+                product: None,
+                serial_number: None,
+                vendor_id: None,
+                product_id: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatInfo {
+    pub port_name: String,
+    pub baud_rate: u32,
+    pub system_id: u8,
+    pub component_id: u8,
+    pub vehicle_type: String,
+    pub autopilot: String,
+    pub system_status: String,
+    pub mavlink_version: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetrySnapshot {
+    pub message_count: u64,
+    pub armed: Option<bool>,
+    pub custom_mode: Option<u32>,
+    pub system_status: Option<String>,
+    pub cpu_load_percent: Option<f32>,
+    pub battery_voltage_v: Option<f32>,
+    pub battery_current_a: Option<f32>,
+    pub battery_remaining_percent: Option<i8>,
+    pub roll_rad: Option<f32>,
+    pub pitch_rad: Option<f32>,
+    pub yaw_rad: Option<f32>,
+    pub gps_fix: Option<String>,
+    pub satellites_visible: Option<u8>,
+    pub rc_channels: Option<[u16; 18]>,
+    pub rc_channel_count: Option<u8>,
+    pub rc_rssi: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParameterValue {
+    pub name: String,
+    pub value: f32,
+    pub parameter_type: String,
+    pub index: u16,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParameterSnapshot {
+    pub items: Vec<ParameterValue>,
+    pub received_count: usize,
+    pub refresh_received_count: usize,
+    pub total_count: u16,
+    pub complete: bool,
+    pub loading: bool,
+}
+
+enum WorkerCommand {
+    RequestParameters,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ControllerEvent {
+    Heartbeat { heartbeat: HeartbeatInfo },
+    Telemetry { telemetry: TelemetrySnapshot },
+    Disconnected { reason: String, expected: bool },
+}
+
+pub struct ControllerSession {
+    stop: Arc<AtomicBool>,
+    commands: mpsc::Sender<WorkerCommand>,
+    worker: JoinHandle<()>,
+}
+
+#[derive(Default)]
+pub struct ControllerManager {
+    session: Mutex<Option<ControllerSession>>,
+    latest_telemetry: Arc<Mutex<Option<TelemetrySnapshot>>>,
+    latest_parameters: Arc<Mutex<ParameterSnapshot>>,
+}
+
+impl ControllerManager {
+    pub fn connect(
+        &self,
+        app: AppHandle,
+        port_name: String,
+        baud_rate: u32,
+    ) -> Result<HeartbeatInfo, String> {
+        self.disconnect();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_telemetry = Arc::clone(&self.latest_telemetry);
+        let worker_parameters = Arc::clone(&self.latest_parameters);
+        *worker_telemetry
+            .lock()
+            .expect("controller telemetry lock poisoned") = None;
+        let (first_heartbeat_tx, first_heartbeat_rx) = mpsc::sync_channel(1);
+        let (commands, worker_commands) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_session(
+                app,
+                port_name,
+                baud_rate,
+                worker_stop,
+                worker_telemetry,
+                worker_parameters,
+                worker_commands,
+                first_heartbeat_tx,
+            );
+        });
+
+        *self
+            .session
+            .lock()
+            .expect("controller session lock poisoned") = Some(ControllerSession {
+            stop,
+            commands,
+            worker,
+        });
+
+        match first_heartbeat_rx.recv_timeout(HEARTBEAT_TIMEOUT + Duration::from_secs(1)) {
+            Ok(Ok(heartbeat)) => Ok(heartbeat),
+            Ok(Err(error)) => {
+                self.disconnect();
+                Err(error)
+            }
+            Err(_) => {
+                self.disconnect();
+                Err("Не получен MAVLink heartbeat за отведённое время".to_owned())
+            }
+        }
+    }
+
+    pub fn disconnect(&self) {
+        let session = self
+            .session
+            .lock()
+            .expect("controller session lock poisoned")
+            .take();
+
+        if let Some(session) = session {
+            session.stop.store(true, Ordering::Relaxed);
+            let _ = session.worker.join();
+        }
+
+        *self
+            .latest_telemetry
+            .lock()
+            .expect("controller telemetry lock poisoned") = None;
+        *self
+            .latest_parameters
+            .lock()
+            .expect("controller parameters lock poisoned") = ParameterSnapshot::default();
+    }
+
+    pub fn latest_telemetry(&self) -> Option<TelemetrySnapshot> {
+        self.latest_telemetry
+            .lock()
+            .expect("controller telemetry lock poisoned")
+            .clone()
+    }
+
+    pub fn request_parameters(&self) -> Result<(), String> {
+        let mut parameters = self
+            .latest_parameters
+            .lock()
+            .expect("controller parameters lock poisoned");
+        parameters.loading = true;
+        parameters.complete = false;
+        parameters.refresh_received_count = 0;
+        drop(parameters);
+        let session = self
+            .session
+            .lock()
+            .expect("controller session lock poisoned");
+        let session = session
+            .as_ref()
+            .ok_or_else(|| "Полётный контроллер не подключён".to_owned())?;
+        session
+            .commands
+            .send(WorkerCommand::RequestParameters)
+            .map_err(|_| "Сессия контроллера уже завершена".to_owned())
+    }
+
+    pub fn latest_parameters(&self) -> ParameterSnapshot {
+        self.latest_parameters
+            .lock()
+            .expect("controller parameters lock poisoned")
+            .clone()
+    }
+}
+
+pub fn list_serial_ports() -> Result<Vec<SerialPortDescriptor>, String> {
+    let mut ports: Vec<_> = serialport::available_ports()
+        .map_err(|error| format!("Не удалось получить список Serial-портов: {error}"))?
+        .into_iter()
+        .map(SerialPortDescriptor::from)
+        .collect();
+
+    ports.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(ports)
+}
+
+#[cfg(test)]
+pub fn wait_for_heartbeat(port_name: String, baud_rate: u32) -> Result<HeartbeatInfo, String> {
+    let port = serialport::new(&port_name, baud_rate)
+        .timeout(READ_TIMEOUT)
+        .open()
+        .map_err(|error| format!("Не удалось открыть {port_name}: {error}"))?;
+
+    let mut reader = PeekReader::new(BufReader::new(port));
+    let deadline = Instant::now() + HEARTBEAT_TIMEOUT;
+
+    while Instant::now() < deadline {
+        match mavlink::read_any_msg::<MavMessage, _>(&mut reader) {
+            Ok((header, MavMessage::HEARTBEAT(heartbeat))) => {
+                return Ok(HeartbeatInfo {
+                    port_name,
+                    baud_rate,
+                    system_id: header.system_id,
+                    component_id: header.component_id,
+                    vehicle_type: format!("{:?}", heartbeat.mavtype),
+                    autopilot: format!("{:?}", heartbeat.autopilot),
+                    system_status: format!("{:?}", heartbeat.system_status),
+                    mavlink_version: heartbeat.mavlink_version,
+                });
+            }
+            Ok(_) | Err(_) => continue,
+        }
+    }
+
+    Err(format!(
+        "На {port_name} не получен MAVLink heartbeat за {} с",
+        HEARTBEAT_TIMEOUT.as_secs()
+    ))
+}
+
+fn run_session(
+    app: AppHandle,
+    port_name: String,
+    baud_rate: u32,
+    stop: Arc<AtomicBool>,
+    latest_telemetry: Arc<Mutex<Option<TelemetrySnapshot>>>,
+    latest_parameters: Arc<Mutex<ParameterSnapshot>>,
+    commands: mpsc::Receiver<WorkerCommand>,
+    first_heartbeat_tx: mpsc::SyncSender<Result<HeartbeatInfo, String>>,
+) {
+    let port = match serialport::new(&port_name, baud_rate)
+        .timeout(READ_TIMEOUT)
+        .open()
+    {
+        Ok(port) => port,
+        Err(error) => {
+            let _ =
+                first_heartbeat_tx.send(Err(format!("Не удалось открыть {port_name}: {error}")));
+            return;
+        }
+    };
+
+    let mut writer = match port.try_clone() {
+        Ok(writer) => writer,
+        Err(error) => {
+            let _ = first_heartbeat_tx.send(Err(format!(
+                "Не удалось подготовить канал запросов телеметрии на {port_name}: {error}"
+            )));
+            return;
+        }
+    };
+    let mut reader = PeekReader::new(BufReader::new(port));
+    let started_at = Instant::now();
+    let mut first_heartbeat_tx = Some(first_heartbeat_tx);
+    let mut last_heartbeat: Option<Instant> = None;
+    let mut last_telemetry_emit = Instant::now();
+    let mut telemetry = TelemetrySnapshot::default();
+    let mut read_error_count = 0_u32;
+    let mut telemetry_requested = false;
+    let mut outbound_sequence = 0_u8;
+    let mut parameters = BTreeMap::<u16, ParameterValue>::new();
+
+    while !stop.load(Ordering::Relaxed) {
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                WorkerCommand::RequestParameters => {
+                    if let Err(error) =
+                        request_parameter_list(&mut writer, 1, 1, &mut outbound_sequence)
+                    {
+                        eprintln!("Failed to request parameters on {port_name}: {error}");
+                    } else {
+                        parameters.clear();
+                    }
+                }
+            }
+        }
+
+        match mavlink::read_any_msg::<MavMessage, _>(&mut reader) {
+            Ok((header, message)) => {
+                read_error_count = 0;
+                telemetry.message_count += 1;
+                update_telemetry(&mut telemetry, &message);
+                if let MavMessage::PARAM_VALUE(data) = &message {
+                    let parameter = ParameterValue {
+                        name: data.param_id.to_str().unwrap_or("").to_owned(),
+                        value: data.param_value,
+                        parameter_type: format!("{:?}", data.param_type),
+                        index: data.param_index,
+                    };
+                    parameters.insert(data.param_index, parameter);
+                    let refresh_received_count = parameters.len();
+                    let refresh_complete = refresh_received_count >= usize::from(data.param_count);
+                    let mut snapshot = latest_parameters
+                        .lock()
+                        .expect("controller parameters lock poisoned");
+
+                    // Keep the previous complete list visible while a refresh is in progress.
+                    // During the first load there is no cache, so partial results are useful.
+                    if snapshot.items.is_empty() || refresh_complete {
+                        snapshot.items = parameters.values().cloned().collect();
+                        snapshot.received_count = refresh_received_count;
+                    }
+                    snapshot.refresh_received_count = refresh_received_count;
+                    snapshot.total_count = data.param_count;
+                    snapshot.complete = refresh_complete;
+                    snapshot.loading = !refresh_complete;
+                }
+                *latest_telemetry
+                    .lock()
+                    .expect("controller telemetry lock poisoned") = Some(telemetry.clone());
+
+                if let MavMessage::HEARTBEAT(heartbeat) = message
+                    && heartbeat.autopilot != MavAutopilot::MAV_AUTOPILOT_INVALID
+                {
+                    let info = HeartbeatInfo {
+                        port_name: port_name.clone(),
+                        baud_rate,
+                        system_id: header.system_id,
+                        component_id: header.component_id,
+                        vehicle_type: format!("{:?}", heartbeat.mavtype),
+                        autopilot: format!("{:?}", heartbeat.autopilot),
+                        system_status: format!("{:?}", heartbeat.system_status),
+                        mavlink_version: heartbeat.mavlink_version,
+                    };
+                    last_heartbeat = Some(Instant::now());
+                    eprintln!(
+                        "MAVLink heartbeat on {port_name}: {}:{}",
+                        header.system_id, header.component_id
+                    );
+
+                    if let Some(sender) = first_heartbeat_tx.take() {
+                        let _ = sender.send(Ok(info.clone()));
+                    }
+
+                    if !telemetry_requested {
+                        telemetry_requested = request_telemetry_messages(
+                            &mut writer,
+                            header.system_id,
+                            header.component_id,
+                            &mut outbound_sequence,
+                            &port_name,
+                        );
+                    }
+
+                    if let Err(error) = app.emit(
+                        "flight-controller-event",
+                        ControllerEvent::Heartbeat { heartbeat: info },
+                    ) {
+                        eprintln!("Failed to emit heartbeat event: {error}");
+                    }
+                }
+
+                if last_telemetry_emit.elapsed() >= TELEMETRY_EMIT_INTERVAL {
+                    if let Err(error) = app.emit(
+                        "flight-controller-event",
+                        ControllerEvent::Telemetry {
+                            telemetry: telemetry.clone(),
+                        },
+                    ) {
+                        eprintln!("Failed to emit telemetry event: {error}");
+                    }
+                    last_telemetry_emit = Instant::now();
+                }
+            }
+            Err(error) => {
+                read_error_count += 1;
+                if read_error_count <= 3 {
+                    eprintln!("MAVLink read error on {port_name}: {error:?}");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        if first_heartbeat_tx.is_some() && started_at.elapsed() >= HEARTBEAT_TIMEOUT {
+            if let Some(sender) = first_heartbeat_tx.take() {
+                let _ = sender.send(Err(format!(
+                    "На {port_name} не получен MAVLink heartbeat за {} с",
+                    HEARTBEAT_TIMEOUT.as_secs()
+                )));
+            }
+            break;
+        }
+
+        if last_heartbeat.is_some_and(|instant| instant.elapsed() >= HEARTBEAT_LOSS_TIMEOUT) {
+            eprintln!("MAVLink heartbeat lost on {port_name}");
+            let reason = "Потерян MAVLink heartbeat".to_owned();
+            let _ = app.emit(
+                "flight-controller-event",
+                ControllerEvent::Disconnected {
+                    reason: reason.clone(),
+                    expected: false,
+                },
+            );
+            break;
+        }
+    }
+
+    if stop.load(Ordering::Relaxed) {
+        let _ = app.emit(
+            "flight-controller-event",
+            ControllerEvent::Disconnected {
+                reason: "Соединение закрыто пользователем".to_owned(),
+                expected: true,
+            },
+        );
+    }
+}
+
+fn request_parameter_list(
+    writer: &mut Box<dyn serialport::SerialPort>,
+    target_system: u8,
+    target_component: u8,
+    sequence: &mut u8,
+) -> Result<(), String> {
+    let request = MavMessage::PARAM_REQUEST_LIST(PARAM_REQUEST_LIST_DATA {
+        target_system,
+        target_component,
+    });
+    let header = MavHeader {
+        system_id: 255,
+        component_id: 190,
+        sequence: *sequence,
+    };
+    mavlink::write_v2_msg(writer, header, &request)
+        .map_err(|error| format!("Не удалось отправить PARAM_REQUEST_LIST: {error}"))?;
+    *sequence = sequence.wrapping_add(1);
+    Ok(())
+}
+
+fn request_telemetry_messages(
+    writer: &mut Box<dyn serialport::SerialPort>,
+    target_system: u8,
+    target_component: u8,
+    sequence: &mut u8,
+    port_name: &str,
+) -> bool {
+    // SYS_STATUS, GPS_RAW_INT, ATTITUDE, RC_CHANNELS and BATTERY_STATUS.
+    let requests = [
+        (1_u32, 500_000_u32),
+        (24, 500_000),
+        (30, 200_000),
+        (65, 200_000),
+        (147, 500_000),
+    ];
+
+    for (message_id, interval_us) in requests {
+        let command = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+            param1: message_id as f32,
+            param2: interval_us as f32,
+            param3: 0.0,
+            param4: 0.0,
+            param5: 0.0,
+            param6: 0.0,
+            param7: 0.0,
+            command: MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL,
+            target_system,
+            target_component,
+            confirmation: 0,
+        });
+        let header = MavHeader {
+            system_id: 255,
+            component_id: 190,
+            sequence: *sequence,
+        };
+
+        if let Err(error) = mavlink::write_v2_msg(writer, header, &command) {
+            eprintln!("Failed to request MAVLink message {message_id} on {port_name}: {error}");
+            return false;
+        }
+        *sequence = sequence.wrapping_add(1);
+    }
+
+    eprintln!("Requested MAVLink telemetry messages on {port_name}");
+    true
+}
+
+fn update_telemetry(snapshot: &mut TelemetrySnapshot, message: &MavMessage) {
+    match message {
+        MavMessage::HEARTBEAT(data) => {
+            snapshot.armed = Some(
+                data.base_mode
+                    .contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED),
+            );
+            snapshot.custom_mode = Some(data.custom_mode);
+            snapshot.system_status = Some(format!("{:?}", data.system_status));
+        }
+        MavMessage::SYS_STATUS(data) => {
+            snapshot.cpu_load_percent = Some(f32::from(data.load) / 10.0);
+            snapshot.battery_voltage_v = (data.voltage_battery != u16::MAX)
+                .then(|| f32::from(data.voltage_battery) / 1000.0);
+            snapshot.battery_current_a =
+                (data.current_battery >= 0).then(|| f32::from(data.current_battery) / 100.0);
+            snapshot.battery_remaining_percent =
+                (data.battery_remaining >= 0).then_some(data.battery_remaining);
+        }
+        MavMessage::BATTERY_STATUS(data) => {
+            snapshot.battery_current_a =
+                (data.current_battery >= 0).then(|| f32::from(data.current_battery) / 100.0);
+            snapshot.battery_remaining_percent =
+                (data.battery_remaining >= 0).then_some(data.battery_remaining);
+        }
+        MavMessage::ATTITUDE(data) => {
+            snapshot.roll_rad = Some(data.roll);
+            snapshot.pitch_rad = Some(data.pitch);
+            snapshot.yaw_rad = Some(data.yaw);
+        }
+        MavMessage::GPS_RAW_INT(data) => {
+            snapshot.gps_fix = Some(format!("{:?}", data.fix_type));
+            snapshot.satellites_visible =
+                (data.satellites_visible != u8::MAX).then_some(data.satellites_visible);
+        }
+        MavMessage::RC_CHANNELS(data) => {
+            snapshot.rc_channels = Some([
+                data.chan1_raw,
+                data.chan2_raw,
+                data.chan3_raw,
+                data.chan4_raw,
+                data.chan5_raw,
+                data.chan6_raw,
+                data.chan7_raw,
+                data.chan8_raw,
+                data.chan9_raw,
+                data.chan10_raw,
+                data.chan11_raw,
+                data.chan12_raw,
+                data.chan13_raw,
+                data.chan14_raw,
+                data.chan15_raw,
+                data.chan16_raw,
+                data.chan17_raw,
+                data.chan18_raw,
+            ]);
+            snapshot.rc_channel_count = Some(data.chancount);
+            snapshot.rc_rssi = (data.rssi != u8::MAX).then_some(data.rssi);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::BufReader;
+    use std::time::{Duration, Instant};
+
+    use mavlink::dialects::ardupilotmega::MavMessage;
+    use mavlink::peek_reader::PeekReader;
+
+    use super::{
+        READ_TIMEOUT, SerialPortDescriptor, SerialPortInfo, SerialPortType, request_parameter_list,
+        request_telemetry_messages, wait_for_heartbeat,
+    };
+
+    #[test]
+    fn converts_unknown_serial_port() {
+        let descriptor = SerialPortDescriptor::from(SerialPortInfo {
+            port_name: "test-port".to_owned(),
+            port_type: SerialPortType::Unknown,
+        });
+
+        assert_eq!(descriptor.name, "test-port");
+        assert_eq!(descriptor.kind, "unknown");
+    }
+
+    #[test]
+    #[ignore = "requires a real flight controller and UAV_TEST_SERIAL_PORT"]
+    fn receives_heartbeat_from_hardware() {
+        let port = std::env::var("UAV_TEST_SERIAL_PORT")
+            .expect("UAV_TEST_SERIAL_PORT must contain a serial device path");
+        let heartbeat = wait_for_heartbeat(port, 115_200).expect("heartbeat should be received");
+
+        eprintln!("hardware heartbeat: {heartbeat:?}");
+    }
+
+    #[test]
+    #[ignore = "requires a real flight controller and UAV_TEST_SERIAL_PORT"]
+    fn receives_requested_telemetry_from_hardware() {
+        let port_name = std::env::var("UAV_TEST_SERIAL_PORT")
+            .expect("UAV_TEST_SERIAL_PORT must contain a serial device path");
+        let port = serialport::new(&port_name, 115_200)
+            .timeout(READ_TIMEOUT)
+            .open()
+            .expect("serial port should open");
+        let mut writer = port.try_clone().expect("serial port should clone");
+        let mut reader = PeekReader::new(BufReader::new(port));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut requested = false;
+        let mut sequence = 0;
+        let mut received = Vec::new();
+
+        while Instant::now() < deadline {
+            let Ok((header, message)) = mavlink::read_any_msg::<MavMessage, _>(&mut reader) else {
+                continue;
+            };
+
+            if matches!(message, MavMessage::HEARTBEAT(_)) && !requested {
+                requested = request_telemetry_messages(
+                    &mut writer,
+                    header.system_id,
+                    header.component_id,
+                    &mut sequence,
+                    &port_name,
+                );
+            }
+
+            let name = match message {
+                MavMessage::SYS_STATUS(_) => Some("SYS_STATUS"),
+                MavMessage::GPS_RAW_INT(_) => Some("GPS_RAW_INT"),
+                MavMessage::ATTITUDE(_) => Some("ATTITUDE"),
+                MavMessage::RC_CHANNELS(_) => Some("RC_CHANNELS"),
+                MavMessage::BATTERY_STATUS(_) => Some("BATTERY_STATUS"),
+                _ => None,
+            };
+            if let Some(name) = name
+                && !received.contains(&name)
+            {
+                received.push(name);
+            }
+        }
+
+        eprintln!("requested telemetry received: {received:?}");
+        assert!(requested, "telemetry request should be sent");
+        assert!(
+            !received.is_empty(),
+            "no requested telemetry messages received"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a real flight controller and UAV_TEST_SERIAL_PORT"]
+    fn receives_parameter_list_from_hardware() {
+        let port_name = std::env::var("UAV_TEST_SERIAL_PORT")
+            .expect("UAV_TEST_SERIAL_PORT must contain a serial device path");
+        let port = serialport::new(&port_name, 115_200)
+            .timeout(READ_TIMEOUT)
+            .open()
+            .expect("serial port should open");
+        let mut writer = port.try_clone().expect("serial port should clone");
+        let mut reader = PeekReader::new(BufReader::new(port));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut requested = false;
+        let mut sequence = 0;
+        let mut names = std::collections::BTreeSet::new();
+        let mut expected = 0_u16;
+
+        while Instant::now() < deadline {
+            let Ok((header, message)) = mavlink::read_any_msg::<MavMessage, _>(&mut reader) else {
+                continue;
+            };
+            if matches!(message, MavMessage::HEARTBEAT(_)) && !requested {
+                request_parameter_list(
+                    &mut writer,
+                    header.system_id,
+                    header.component_id,
+                    &mut sequence,
+                )
+                .expect("parameter request should be sent");
+                requested = true;
+            }
+            if let MavMessage::PARAM_VALUE(data) = message {
+                expected = data.param_count;
+                names.insert(data.param_id.to_str().unwrap_or("").to_owned());
+                if names.len() >= usize::from(expected) {
+                    break;
+                }
+            }
+        }
+
+        eprintln!("parameters received: {}/{}", names.len(), expected);
+        assert!(expected > 0, "controller did not report parameter count");
+        assert_eq!(names.len(), usize::from(expected));
+        assert!(names.iter().all(|name| !name.is_empty()));
+    }
+}

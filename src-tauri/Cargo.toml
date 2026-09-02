@@ -1,0 +1,20 @@
+[package]
+name = "uav-test-station"
+version = "0.1.0"
+description = "UAV test and calibration station"
+authors = ["UAV Test Station contributors"]
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "uav_test_station_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mavlink = { version = "0.18", default-features = false, features = ["std", "dialect-ardupilotmega", "transport-direct-serial"] }
+serde = { version = "1", features = ["derive"] }
+serialport = { version = "4", default-features = false }
+tauri = { version = "2", features = [] }

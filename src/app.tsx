@@ -1,0 +1,502 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useEffect, useState } from "preact/hooks";
+
+type Tab = {
+  id: string;
+  label: string;
+  available: boolean;
+  unavailableReason?: string;
+};
+
+type SerialPortDescriptor = {
+  name: string;
+  kind: "usb" | "bluetooth" | "pci" | "unknown";
+  product?: string;
+};
+
+type HeartbeatInfo = {
+  portName: string;
+  baudRate: number;
+  systemId: number;
+  componentId: number;
+  vehicleType: string;
+  autopilot: string;
+  systemStatus: string;
+  mavlinkVersion: number;
+};
+
+type TelemetrySnapshot = {
+  messageCount: number;
+  armed?: boolean;
+  customMode?: number;
+  systemStatus?: string;
+  cpuLoadPercent?: number;
+  batteryVoltageV?: number;
+  batteryCurrentA?: number;
+  batteryRemainingPercent?: number;
+  rollRad?: number;
+  pitchRad?: number;
+  yawRad?: number;
+  gpsFix?: string;
+  satellitesVisible?: number;
+  rcChannels?: number[];
+  rcChannelCount?: number;
+  rcRssi?: number;
+};
+
+type ControllerEvent =
+  | { kind: "heartbeat"; heartbeat: HeartbeatInfo }
+  | { kind: "telemetry"; telemetry: TelemetrySnapshot }
+  | { kind: "disconnected"; reason: string; expected: boolean };
+
+type ParameterValue = {
+  name: string;
+  value: number;
+  parameterType: string;
+  index: number;
+};
+
+type ParameterSnapshot = {
+  items: ParameterValue[];
+  receivedCount: number;
+  refreshReceivedCount: number;
+  totalCount: number;
+  complete: boolean;
+  loading: boolean;
+};
+
+type ConnectionCardProps = {
+  label: string;
+  description: string;
+  optional?: boolean;
+};
+
+function ConnectionCard({ label, description, optional = false }: ConnectionCardProps) {
+  return (
+    <article class="connection-card">
+      <div class="connection-heading">
+        <span class="status-dot" aria-hidden="true" />
+        <div>
+          <h3>{label}</h3>
+          <p>{description}</p>
+        </div>
+      </div>
+      <div class="connection-footer">
+        <span class="status-label">Не подключено</span>
+        <button type="button" disabled>
+          {optional ? "Настроить позже" : "Подключить"}
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function Metric({ label, value, unit }: { label: string; value?: string | number; unit?: string }) {
+  return (
+    <div class="metric">
+      <span>{label}</span>
+      <strong>{value ?? "Нет данных"}</strong>
+      {value !== undefined && unit && <small>{unit}</small>}
+    </div>
+  );
+}
+
+export function App() {
+  const isTauriRuntime = "__TAURI_INTERNALS__" in window;
+  const [activeTab, setActiveTab] = useState("connections");
+  const [ports, setPorts] = useState<SerialPortDescriptor[]>([]);
+  const [selectedPort, setSelectedPort] = useState("");
+  const [heartbeat, setHeartbeat] = useState<HeartbeatInfo | null>(null);
+  const [telemetry, setTelemetry] = useState<TelemetrySnapshot | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [isScanning, setIsScanning] = useState(true);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [parameters, setParameters] = useState<ParameterSnapshot | null>(null);
+  const [parameterSearch, setParameterSearch] = useState("");
+  const [parameterError, setParameterError] = useState<string | null>(null);
+
+  const scanPorts = () => {
+    if (!isTauriRuntime) {
+      setIsScanning(false);
+      return;
+    }
+    setIsScanning(true);
+    setConnectionError(null);
+    invoke<SerialPortDescriptor[]>("scan_serial_ports")
+      .then((availablePorts) => {
+        const hardwarePorts = availablePorts.filter(
+          (port) => port.kind === "usb" || port.kind === "pci",
+        );
+        setPorts(hardwarePorts);
+        setSelectedPort((current) =>
+          hardwarePorts.some((port) => port.name === current)
+            ? current
+            : (hardwarePorts[0]?.name ?? ""),
+        );
+      })
+      .catch((error: unknown) => setConnectionError(String(error)))
+      .finally(() => setIsScanning(false));
+  };
+
+  useEffect(() => {
+    if (!isTauriRuntime) {
+      setIsScanning(false);
+      return;
+    }
+
+    let unlisten: UnlistenFn | undefined;
+    listen<ControllerEvent>("flight-controller-event", ({ payload }) => {
+      if (payload.kind === "heartbeat") {
+        setHeartbeat(payload.heartbeat);
+        setConnectionError(null);
+      } else if (payload.kind === "telemetry") {
+        setTelemetry(payload.telemetry);
+      } else {
+        setHeartbeat(null);
+        setTelemetry(null);
+        setConnectionError(payload.expected ? null : payload.reason);
+        setActiveTab("connections");
+      }
+    }).then((stopListening) => {
+      unlisten = stopListening;
+    });
+
+    scanPorts();
+    return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime || !heartbeat) return;
+
+    let cancelled = false;
+    const refreshTelemetry = () => {
+      invoke<TelemetrySnapshot | null>("get_flight_controller_telemetry")
+        .then((snapshot) => {
+          if (!cancelled && snapshot) setTelemetry(snapshot);
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) setConnectionError(String(error));
+        });
+    };
+
+    refreshTelemetry();
+    const timer = window.setInterval(refreshTelemetry, 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [heartbeat]);
+
+  useEffect(() => {
+    if (!isTauriRuntime || !heartbeat || activeTab !== "parameters") return;
+
+    let cancelled = false;
+    setParameterError(null);
+    invoke("request_flight_controller_parameters").catch((error: unknown) => {
+      if (!cancelled) setParameterError(String(error));
+    });
+
+    const refreshParameters = () => {
+      invoke<ParameterSnapshot>("get_flight_controller_parameters")
+        .then((snapshot) => {
+          if (!cancelled) setParameters(snapshot);
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) setParameterError(String(error));
+        });
+    };
+    refreshParameters();
+    const timer = window.setInterval(refreshParameters, 300);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeTab, heartbeat]);
+
+  const connectFlightController = () => {
+    if (!selectedPort) return;
+    setIsConnecting(true);
+    setConnectionError(null);
+    setHeartbeat(null);
+    setTelemetry(null);
+    invoke<HeartbeatInfo>("connect_flight_controller", {
+      portName: selectedPort,
+      baudRate: 115200,
+    })
+      .then(setHeartbeat)
+      .catch((error: unknown) => setConnectionError(String(error)))
+      .finally(() => setIsConnecting(false));
+  };
+
+  const disconnectFlightController = () => {
+    setIsConnecting(true);
+    invoke("disconnect_flight_controller")
+      .catch((error: unknown) => setConnectionError(String(error)))
+      .finally(() => {
+        setHeartbeat(null);
+        setTelemetry(null);
+        setIsConnecting(false);
+        setActiveTab("connections");
+      });
+  };
+
+  const hasAnyConnection = heartbeat !== null;
+  const tabs: Tab[] = [
+    { id: "connections", label: "Подключения", available: true },
+    {
+      id: "tests",
+      label: "Испытания",
+      available: hasAnyConnection,
+      unavailableReason: "Подключите хотя бы одно устройство",
+    },
+    {
+      id: "telemetry",
+      label: "Телеметрия",
+      available: hasAnyConnection,
+      unavailableReason: "Подключите источник телеметрии или измерений",
+    },
+    {
+      id: "control",
+      label: "Управление",
+      available: false,
+      unavailableReason: "Требуется управляющее соединение",
+    },
+    {
+      id: "parameters",
+      label: "Параметры",
+      available: hasAnyConnection,
+      unavailableReason: "Требуется подключение полётного контроллера",
+    },
+    { id: "scenarios", label: "Сценарии", available: true },
+    { id: "results", label: "Результаты", available: true },
+  ];
+  const normalizedParameterSearch = parameterSearch.trim().toLowerCase();
+  const parameterGroups = Object.entries(
+    (parameters?.items ?? [])
+      .filter((parameter) => parameter.name.toLowerCase().includes(normalizedParameterSearch))
+      .reduce<Record<string, ParameterValue[]>>((groups, parameter) => {
+        const prefix = parameter.name.split("_")[0].replace(/\d+$/, "") || "OTHER";
+        (groups[prefix] ??= []).push(parameter);
+        return groups;
+      }, {}),
+  ).sort(([left], [right]) => left.localeCompare(right));
+
+  return (
+    <div class="app-shell">
+      <nav class="tabs" aria-label="Основные разделы">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            class={tab.id === activeTab ? "tab active" : "tab"}
+            type="button"
+            disabled={!tab.available}
+            title={tab.available ? undefined : tab.unavailableReason}
+            aria-current={tab.id === activeTab ? "page" : undefined}
+            onClick={() => setActiveTab(tab.id)}
+          >
+            {tab.label}
+            {!tab.available && <span class="lock" aria-hidden="true">●</span>}
+          </button>
+        ))}
+      </nav>
+
+      <main>
+        {activeTab === "connections" && (
+          <>
+            <section class="hero">
+              <p class="eyebrow">Подготовка стенда</p>
+              <h1>Подключения</h1>
+              <p class="hero-copy">
+                Перед запуском испытания подключите контроллер и эталонный амперметр.
+                Управляющий маршрут выбирается отдельно.
+              </p>
+            </section>
+
+            <section class="connection-grid" aria-label="Подключения устройств">
+              <article class={heartbeat ? "connection-card connected" : "connection-card"}>
+                <div class="connection-heading">
+                  <span class="status-dot" aria-hidden="true" />
+                  <div>
+                    <h3>Полётный контроллер</h3>
+                    <p>USB · MAVLink · только чтение</p>
+                  </div>
+                </div>
+
+                {heartbeat ? (
+                  <dl class="device-details">
+                    <div><dt>Порт</dt><dd>{heartbeat.portName}</dd></div>
+                    <div><dt>Система</dt><dd>{heartbeat.systemId}:{heartbeat.componentId}</dd></div>
+                    <div><dt>Тип</dt><dd>{heartbeat.vehicleType}</dd></div>
+                    <div><dt>Автопилот</dt><dd>{heartbeat.autopilot}</dd></div>
+                    <div><dt>Состояние</dt><dd>{heartbeat.systemStatus}</dd></div>
+                  </dl>
+                ) : (
+                  <div class="port-picker">
+                    <label for="flight-controller-port">Serial-порт</label>
+                    <select
+                      id="flight-controller-port"
+                      value={selectedPort}
+                      onChange={(event) => setSelectedPort(event.currentTarget.value)}
+                      disabled={isScanning || isConnecting}
+                    >
+                      {ports.length === 0 && <option value="">USB-устройства не найдены</option>}
+                      {ports.map((port) => (
+                        <option key={port.name} value={port.name}>
+                          {port.product ? `${port.product} · ` : ""}{port.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {connectionError && <p class="connection-error">{connectionError}</p>}
+                <div class="connection-footer">
+                  <span class="status-label">
+                    {heartbeat
+                      ? "Постоянная сессия активна"
+                      : isConnecting
+                        ? "Ожидание heartbeat…"
+                        : `${ports.length} USB-порт(а)`}
+                  </span>
+                  {heartbeat ? (
+                    <button type="button" onClick={disconnectFlightController} disabled={isConnecting}>
+                      Отключить
+                    </button>
+                  ) : (
+                    <div class="connection-actions">
+                      <button type="button" onClick={scanPorts} disabled={isScanning || isConnecting}>
+                        Обновить
+                      </button>
+                      <button
+                        class="primary-button"
+                        type="button"
+                        onClick={connectFlightController}
+                        disabled={!selectedPort || isScanning || isConnecting}
+                      >
+                        Подключить
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </article>
+              <ConnectionCard label="Arduino-амперметр" description="USB · Serial" />
+              <ConnectionCard
+                label="Управляющий маршрут"
+                description="Через соединение контроллера"
+                optional
+              />
+            </section>
+
+            <section class="safety-panel">
+              <div>
+                <p class="eyebrow">Состояние системы</p>
+                <h2>{heartbeat ? "CONNECTED" : "DISCONNECTED"}</h2>
+              </div>
+              <p>
+                {heartbeat
+                  ? "Контроллер отвечает по MAVLink. Управляющие воздействия и запись параметров по-прежнему заблокированы."
+                  : "Управляющие воздействия заблокированы, пока обязательные устройства не подключены и стенд не переведён в безопасное состояние."}
+              </p>
+            </section>
+          </>
+        )}
+
+        {activeTab === "telemetry" && heartbeat && (
+          <>
+            <section class="hero compact-hero">
+              <p class="eyebrow">MAVLink · {heartbeat.portName}</p>
+              <h1>Телеметрия</h1>
+              <p class="hero-copy">Текущие входящие данные. Отсутствующие сигналы не заменяются нулевыми значениями.</p>
+            </section>
+            <section class="telemetry-grid">
+              <Metric label="Состояние" value={telemetry?.systemStatus ?? heartbeat.systemStatus} />
+              <Metric label="Arm" value={telemetry?.armed === undefined ? undefined : telemetry.armed ? "ARMED" : "DISARMED"} />
+              <Metric label="Загрузка CPU" value={telemetry?.cpuLoadPercent?.toFixed(1)} unit="%" />
+              <Metric label="Сообщений принято" value={telemetry?.messageCount} />
+              <Metric label="Напряжение" value={telemetry?.batteryVoltageV?.toFixed(2)} unit="V" />
+              <Metric label="Ток контроллера" value={telemetry?.batteryCurrentA?.toFixed(2)} unit="A" />
+              <Metric label="Заряд" value={telemetry?.batteryRemainingPercent} unit="%" />
+              <Metric label="GPS fix" value={telemetry?.gpsFix} />
+              <Metric label="Спутники" value={telemetry?.satellitesVisible} />
+              <Metric label="Roll" value={telemetry?.rollRad?.toFixed(3)} unit="rad" />
+              <Metric label="Pitch" value={telemetry?.pitchRad?.toFixed(3)} unit="rad" />
+              <Metric label="Yaw" value={telemetry?.yawRad?.toFixed(3)} unit="rad" />
+            </section>
+            <section class="rc-panel">
+              <div>
+                <p class="eyebrow">RC input</p>
+                <h2>{telemetry?.rcChannelCount ? `${telemetry.rcChannelCount} каналов` : "Нет данных"}</h2>
+              </div>
+              <div class="rc-values">
+                {telemetry?.rcChannels?.slice(0, Math.min(telemetry.rcChannelCount ?? 0, 18)).map((value, index) => (
+                  <span key={index}>CH{index + 1} <strong>{value === u16Max ? "—" : value}</strong></span>
+                ))}
+              </div>
+            </section>
+          </>
+        )}
+
+        {activeTab === "parameters" && heartbeat && (
+          <>
+            <div class="parameter-sticky-header">
+              <section class="hero compact-hero parameters-hero">
+                <div class="parameter-title">
+                  <div><p class="eyebrow">MAVLink · только чтение</p><h1>Параметры</h1></div>
+                  <p class="hero-copy">Настройки прошивки контроллера. Запись пока заблокирована.</p>
+                </div>
+                <div class="parameter-progress">
+                  <strong>{parameters?.loading ? parameters.refreshReceivedCount : (parameters?.receivedCount ?? 0)} / {parameters?.totalCount || "—"}</strong>
+                  <span>
+                    {parameters?.loading
+                      ? parameters.items.length > 0 ? "Обновление в фоне · показан кэш" : "Получение параметров…"
+                      : "Загружено"}
+                  </span>
+                </div>
+              </section>
+
+              <section class="parameter-toolbar">
+                <input type="search" value={parameterSearch} placeholder="Поиск по имени параметра" onInput={(event) => setParameterSearch(event.currentTarget.value)} />
+                <button type="button" onClick={() => invoke("request_flight_controller_parameters")}>Обновить</button>
+              </section>
+              {parameterError && <p class="connection-error">{parameterError}</p>}
+            </div>
+            <section class="parameter-groups" aria-label="Параметры прошивки">
+              {parameterGroups.map(([group, items]) => (
+                <details class="parameter-group" key={group} open={normalizedParameterSearch.length > 0 || undefined}>
+                  <summary>
+                    <strong>{group}</strong>
+                    <span>{items.length} параметров</span>
+                  </summary>
+                  <div class="parameter-table">
+                    <div class="parameter-row parameter-header">
+                      <span>Параметр</span><span>Значение</span><span>Тип</span><span>Действие</span>
+                    </div>
+                    {items.map((parameter) => (
+                      <div class="parameter-row" key={parameter.index}>
+                        <strong>{parameter.name}</strong>
+                        <span>{parameter.value}</span>
+                        <span>{parameter.parameterType.replace("MAV_PARAM_TYPE_", "")}</span>
+                        <button type="button" disabled title="Запись будет включена после проверки чтения">Изменить</button>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              ))}
+            </section>
+          </>
+        )}
+
+        {!["connections", "telemetry", "parameters"].includes(activeTab) && (
+          <section class="hero">
+            <p class="eyebrow">Следующий этап</p>
+            <h1>{tabs.find((tab) => tab.id === activeTab)?.label}</h1>
+            <p class="hero-copy">Раздел подключён к навигации и будет реализован на соответствующем этапе.</p>
+          </section>
+        )}
+      </main>
+    </div>
+  );
+}
+
+const u16Max = 65_535;
