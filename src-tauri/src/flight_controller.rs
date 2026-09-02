@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,7 @@ use mavlink::dialects::ardupilotmega::{
     PARAM_REQUEST_LIST_DATA, PARAM_SET_DATA,
 };
 use mavlink::peek_reader::PeekReader;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serialport::{SerialPortInfo, SerialPortType};
 use tauri::{AppHandle, Emitter};
@@ -19,8 +20,39 @@ const READ_TIMEOUT: Duration = Duration::from_millis(200);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_LOSS_TIMEOUT: Duration = Duration::from_secs(3);
 const TELEMETRY_EMIT_INTERVAL: Duration = Duration::from_millis(250);
+const MAVLINK_PARSE_DEADLINE: Duration = Duration::from_millis(300);
 
-#[derive(Debug, Clone, Serialize)]
+struct DeadlineReader<R> {
+    inner: R,
+    deadline: Instant,
+}
+
+impl<R> DeadlineReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            deadline: Instant::now() + MAVLINK_PARSE_DEADLINE,
+        }
+    }
+
+    fn reset_deadline(&mut self) {
+        self.deadline = Instant::now() + MAVLINK_PARSE_DEADLINE;
+    }
+}
+
+impl<R: Read> Read for DeadlineReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "MAVLink parser deadline reached",
+            ));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SerialPortDescriptor {
     pub name: String,
@@ -88,7 +120,7 @@ pub struct HeartbeatInfo {
     pub mavlink_version: u8,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TelemetrySnapshot {
     pub message_count: u64,
@@ -109,7 +141,7 @@ pub struct TelemetrySnapshot {
     pub rc_rssi: Option<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParameterValue {
     pub name: String,
@@ -118,7 +150,7 @@ pub struct ParameterValue {
     pub index: u16,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParameterSnapshot {
     pub items: Vec<ParameterValue>,
@@ -136,7 +168,7 @@ pub struct ParameterWriteRequest {
     pub value: f32,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParameterWriteStatus {
     pub active: bool,
@@ -157,6 +189,8 @@ enum WorkerCommand {
 pub enum ControllerEvent {
     Heartbeat { heartbeat: HeartbeatInfo },
     Telemetry { telemetry: TelemetrySnapshot },
+    Parameters { snapshot: ParameterSnapshot },
+    ParameterWriteStatus { status: ParameterWriteStatus },
     Disconnected { reason: String, expected: bool },
 }
 
@@ -164,6 +198,12 @@ pub struct ControllerSession {
     stop: Arc<AtomicBool>,
     commands: mpsc::Sender<WorkerCommand>,
     worker: JoinHandle<()>,
+}
+
+struct SessionSharedState {
+    latest_telemetry: Arc<Mutex<Option<TelemetrySnapshot>>>,
+    latest_parameters: Arc<Mutex<ParameterSnapshot>>,
+    parameter_write_status: Arc<Mutex<ParameterWriteStatus>>,
 }
 
 #[derive(Default)]
@@ -188,9 +228,7 @@ impl ControllerManager {
         let worker_telemetry = Arc::clone(&self.latest_telemetry);
         let worker_parameters = Arc::clone(&self.latest_parameters);
         let worker_write_status = Arc::clone(&self.parameter_write_status);
-        *worker_telemetry
-            .lock()
-            .expect("controller telemetry lock poisoned") = None;
+        *worker_telemetry.lock() = None;
         let (first_heartbeat_tx, first_heartbeat_rx) = mpsc::sync_channel(1);
         let (commands, worker_commands) = mpsc::channel();
         let worker = thread::spawn(move || {
@@ -199,18 +237,17 @@ impl ControllerManager {
                 port_name,
                 baud_rate,
                 worker_stop,
-                worker_telemetry,
-                worker_parameters,
-                worker_write_status,
+                SessionSharedState {
+                    latest_telemetry: worker_telemetry,
+                    latest_parameters: worker_parameters,
+                    parameter_write_status: worker_write_status,
+                },
                 worker_commands,
                 first_heartbeat_tx,
             );
         });
 
-        *self
-            .session
-            .lock()
-            .expect("controller session lock poisoned") = Some(ControllerSession {
+        *self.session.lock() = Some(ControllerSession {
             stop,
             commands,
             worker,
@@ -230,51 +267,25 @@ impl ControllerManager {
     }
 
     pub fn disconnect(&self) {
-        let session = self
-            .session
-            .lock()
-            .expect("controller session lock poisoned")
-            .take();
+        let session = self.session.lock().take();
 
         if let Some(session) = session {
             session.stop.store(true, Ordering::Relaxed);
             let _ = session.worker.join();
         }
 
-        *self
-            .latest_telemetry
-            .lock()
-            .expect("controller telemetry lock poisoned") = None;
-        *self
-            .latest_parameters
-            .lock()
-            .expect("controller parameters lock poisoned") = ParameterSnapshot::default();
-        *self
-            .parameter_write_status
-            .lock()
-            .expect("parameter write status lock poisoned") = ParameterWriteStatus::default();
-    }
-
-    pub fn latest_telemetry(&self) -> Option<TelemetrySnapshot> {
-        self.latest_telemetry
-            .lock()
-            .expect("controller telemetry lock poisoned")
-            .clone()
+        *self.latest_telemetry.lock() = None;
+        *self.latest_parameters.lock() = ParameterSnapshot::default();
+        *self.parameter_write_status.lock() = ParameterWriteStatus::default();
     }
 
     pub fn request_parameters(&self) -> Result<(), String> {
-        let mut parameters = self
-            .latest_parameters
-            .lock()
-            .expect("controller parameters lock poisoned");
+        let mut parameters = self.latest_parameters.lock();
         parameters.loading = true;
         parameters.complete = false;
         parameters.refresh_received_count = 0;
         drop(parameters);
-        let session = self
-            .session
-            .lock()
-            .expect("controller session lock poisoned");
+        let session = self.session.lock();
         let session = session
             .as_ref()
             .ok_or_else(|| "Полётный контроллер не подключён".to_owned())?;
@@ -284,21 +295,11 @@ impl ControllerManager {
             .map_err(|_| "Сессия контроллера уже завершена".to_owned())
     }
 
-    pub fn latest_parameters(&self) -> ParameterSnapshot {
-        self.latest_parameters
-            .lock()
-            .expect("controller parameters lock poisoned")
-            .clone()
-    }
-
     pub fn write_parameters(&self, requests: Vec<ParameterWriteRequest>) -> Result<(), String> {
         if requests.is_empty() || requests.len() > 200 {
             return Err("Выберите от 1 до 200 параметров".to_owned());
         }
-        let parameters = self
-            .latest_parameters
-            .lock()
-            .expect("controller parameters lock poisoned");
+        let parameters = self.latest_parameters.lock();
         for request in &requests {
             if !request.value.is_finite()
                 || !parameters
@@ -313,23 +314,13 @@ impl ControllerManager {
             }
         }
         drop(parameters);
-        let session = self
-            .session
-            .lock()
-            .expect("controller session lock poisoned");
+        let session = self.session.lock();
         session
             .as_ref()
             .ok_or_else(|| "Полётный контроллер не подключён".to_owned())?
             .commands
             .send(WorkerCommand::WriteParameters(requests))
             .map_err(|_| "Сессия контроллера уже завершена".to_owned())
-    }
-
-    pub fn parameter_write_status(&self) -> ParameterWriteStatus {
-        self.parameter_write_status
-            .lock()
-            .expect("parameter write status lock poisoned")
-            .clone()
     }
 }
 
@@ -351,10 +342,11 @@ pub fn wait_for_heartbeat(port_name: String, baud_rate: u32) -> Result<Heartbeat
         .open()
         .map_err(|error| format!("Не удалось открыть {port_name}: {error}"))?;
 
-    let mut reader = PeekReader::new(BufReader::new(port));
+    let mut reader = PeekReader::new(DeadlineReader::new(BufReader::new(port)));
     let deadline = Instant::now() + HEARTBEAT_TIMEOUT;
 
     while Instant::now() < deadline {
+        reader.reader_mut().reset_deadline();
         match mavlink::read_any_msg::<MavMessage, _>(&mut reader) {
             Ok((header, MavMessage::HEARTBEAT(heartbeat))) => {
                 return Ok(HeartbeatInfo {
@@ -383,12 +375,15 @@ fn run_session(
     port_name: String,
     baud_rate: u32,
     stop: Arc<AtomicBool>,
-    latest_telemetry: Arc<Mutex<Option<TelemetrySnapshot>>>,
-    latest_parameters: Arc<Mutex<ParameterSnapshot>>,
-    parameter_write_status: Arc<Mutex<ParameterWriteStatus>>,
+    shared: SessionSharedState,
     commands: mpsc::Receiver<WorkerCommand>,
     first_heartbeat_tx: mpsc::SyncSender<Result<HeartbeatInfo, String>>,
 ) {
+    let SessionSharedState {
+        latest_telemetry,
+        latest_parameters,
+        parameter_write_status,
+    } = shared;
     let port = match serialport::new(&port_name, baud_rate)
         .timeout(READ_TIMEOUT)
         .open()
@@ -410,11 +405,13 @@ fn run_session(
             return;
         }
     };
-    let mut reader = PeekReader::new(BufReader::new(port));
+    let mut reader = PeekReader::new(DeadlineReader::new(BufReader::new(port)));
     let started_at = Instant::now();
     let mut first_heartbeat_tx = Some(first_heartbeat_tx);
     let mut last_heartbeat: Option<Instant> = None;
     let mut last_telemetry_emit = Instant::now();
+    let mut last_parameter_emit = Instant::now() - Duration::from_secs(1);
+    let mut last_emitted_write_status = ParameterWriteStatus::default();
     let mut telemetry = TelemetrySnapshot::default();
     let mut read_error_count = 0_u32;
     let mut telemetry_requested = false;
@@ -435,14 +432,17 @@ fn run_session(
                         eprintln!("Failed to request parameters on {port_name}: {error}");
                     } else {
                         parameters.clear();
+                        let snapshot = latest_parameters.lock().clone();
+                        let _ = app.emit(
+                            "flight-controller-event",
+                            ControllerEvent::Parameters { snapshot },
+                        );
                     }
                 }
                 WorkerCommand::WriteParameters(requests) => {
                     write_queue = requests.into();
                     awaiting_write = None;
-                    *parameter_write_status
-                        .lock()
-                        .expect("parameter write status lock poisoned") = ParameterWriteStatus {
+                    *parameter_write_status.lock() = ParameterWriteStatus {
                         active: true,
                         total: write_queue.len(),
                         ..ParameterWriteStatus::default()
@@ -461,6 +461,7 @@ fn run_session(
             &parameter_write_status,
         );
 
+        reader.reader_mut().reset_deadline();
         match mavlink::read_any_msg::<MavMessage, _>(&mut reader) {
             Ok((header, message)) => {
                 read_error_count = 0;
@@ -481,45 +482,53 @@ fn run_session(
                     let parameter = upsert_parameter_by_name(&mut parameters, parameter);
                     if write_confirmed {
                         awaiting_write = None;
-                        let mut status = parameter_write_status
-                            .lock()
-                            .expect("parameter write status lock poisoned");
+                        let mut status = parameter_write_status.lock();
                         status.completed += 1;
                         status.current_name = None;
                         status.active = status.completed + status.failed < status.total;
                     }
                     let refresh_received_count = parameters.len();
                     let refresh_complete = refresh_received_count >= usize::from(data.param_count);
-                    let mut snapshot = latest_parameters
-                        .lock()
-                        .expect("controller parameters lock poisoned");
+                    let snapshot_for_event = {
+                        let mut snapshot = latest_parameters.lock();
 
-                    // PARAM_SET is acknowledged with PARAM_VALUE. Apply that confirmed
-                    // value directly to the cached list instead of requesting all
-                    // parameters again after a point update.
-                    if write_confirmed
-                        && let Some(cached) = snapshot
-                            .items
-                            .iter_mut()
-                            .find(|item| item.name == parameter_name)
-                    {
-                        *cached = parameter.clone();
-                    }
+                        // PARAM_SET is acknowledged with PARAM_VALUE. Apply that confirmed
+                        // value directly to the cached list instead of requesting all
+                        // parameters again after a point update.
+                        if write_confirmed
+                            && let Some(cached) = snapshot
+                                .items
+                                .iter_mut()
+                                .find(|item| item.name == parameter_name)
+                        {
+                            *cached = parameter.clone();
+                        }
 
-                    // Keep the previous complete list visible while a refresh is in progress.
-                    // During the first load there is no cache, so partial results are useful.
-                    if snapshot.items.is_empty() || refresh_complete {
-                        snapshot.items = parameters.values().cloned().collect();
-                        snapshot.received_count = refresh_received_count;
+                        // Keep the previous complete list visible while a refresh is in progress.
+                        // During the first load there is no cache, so partial results are useful.
+                        if snapshot.items.is_empty() || refresh_complete {
+                            snapshot.items = parameters.values().cloned().collect();
+                            snapshot.received_count = refresh_received_count;
+                        }
+                        snapshot.refresh_received_count = refresh_received_count;
+                        snapshot.total_count = data.param_count;
+                        snapshot.complete = refresh_complete;
+                        snapshot.loading = !refresh_complete;
+
+                        (write_confirmed
+                            || refresh_complete
+                            || last_parameter_emit.elapsed() >= Duration::from_millis(100))
+                        .then(|| snapshot.clone())
+                    };
+                    if let Some(snapshot) = snapshot_for_event {
+                        let _ = app.emit(
+                            "flight-controller-event",
+                            ControllerEvent::Parameters { snapshot },
+                        );
+                        last_parameter_emit = Instant::now();
                     }
-                    snapshot.refresh_received_count = refresh_received_count;
-                    snapshot.total_count = data.param_count;
-                    snapshot.complete = refresh_complete;
-                    snapshot.loading = !refresh_complete;
                 }
-                *latest_telemetry
-                    .lock()
-                    .expect("controller telemetry lock poisoned") = Some(telemetry.clone());
+                *latest_telemetry.lock() = Some(telemetry.clone());
 
                 if let MavMessage::HEARTBEAT(heartbeat) = message
                     && heartbeat.autopilot != MavAutopilot::MAV_AUTOPILOT_INVALID
@@ -582,6 +591,17 @@ fn run_session(
                 }
                 thread::sleep(Duration::from_millis(5));
             }
+        }
+
+        let current_write_status = parameter_write_status.lock().clone();
+        if current_write_status != last_emitted_write_status {
+            let _ = app.emit(
+                "flight-controller-event",
+                ControllerEvent::ParameterWriteStatus {
+                    status: current_write_status.clone(),
+                },
+            );
+            last_emitted_write_status = current_write_status;
         }
 
         if first_heartbeat_tx.is_some() && started_at.elapsed() >= HEARTBEAT_TIMEOUT {
@@ -678,9 +698,7 @@ fn process_parameter_write(
         if *attempts >= 3 {
             let failed_name = request.name.clone();
             *awaiting = None;
-            let mut status = shared_status
-                .lock()
-                .expect("parameter write status lock poisoned");
+            let mut status = shared_status.lock();
             status.failed += 1;
             status.last_error = Some(format!("Контроллер не подтвердил {failed_name}"));
             status.current_name = None;
@@ -705,18 +723,14 @@ fn process_parameter_write(
     }
 
     let Some(request) = queue.pop_front() else {
-        let mut status = shared_status
-            .lock()
-            .expect("parameter write status lock poisoned");
+        let mut status = shared_status.lock();
         if status.completed + status.failed >= status.total {
             status.active = false;
         }
         return;
     };
     let Some(parameter_type) = parameter_types.get(&request.name).copied() else {
-        let mut status = shared_status
-            .lock()
-            .expect("parameter write status lock poisoned");
+        let mut status = shared_status.lock();
         status.failed += 1;
         status.last_error = Some(format!("Неизвестен MAVLink-тип {}", request.name));
         return;
@@ -730,16 +744,11 @@ fn process_parameter_write(
         parameter_type,
     ) {
         Ok(()) => {
-            shared_status
-                .lock()
-                .expect("parameter write status lock poisoned")
-                .current_name = Some(request.name.clone());
+            shared_status.lock().current_name = Some(request.name.clone());
             *awaiting = Some((request, Instant::now(), 1));
         }
         Err(error) => {
-            let mut status = shared_status
-                .lock()
-                .expect("parameter write status lock poisoned");
+            let mut status = shared_status.lock();
             status.failed += 1;
             status.last_error = Some(error);
         }
@@ -892,9 +901,9 @@ mod tests {
     use mavlink::peek_reader::PeekReader;
 
     use super::{
-        ParameterValue, ParameterWriteRequest, READ_TIMEOUT, SerialPortDescriptor, SerialPortInfo,
-        SerialPortType, request_parameter_list, request_telemetry_messages, send_parameter_set,
-        upsert_parameter_by_name, wait_for_heartbeat,
+        DeadlineReader, ParameterValue, ParameterWriteRequest, READ_TIMEOUT, SerialPortDescriptor,
+        SerialPortInfo, SerialPortType, request_parameter_list, request_telemetry_messages,
+        send_parameter_set, upsert_parameter_by_name, wait_for_heartbeat,
     };
 
     #[test]
@@ -936,6 +945,18 @@ mod tests {
     }
 
     #[test]
+    fn mavlink_parser_times_out_on_continuous_wrong_protocol() {
+        let source = std::io::repeat(b'A');
+        let mut reader = PeekReader::new(DeadlineReader::new(source));
+        let started_at = Instant::now();
+
+        let result = mavlink::read_any_msg::<MavMessage, _>(&mut reader);
+
+        assert!(result.is_err());
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     #[ignore = "requires a real flight controller and UAV_TEST_SERIAL_PORT"]
     fn receives_heartbeat_from_hardware() {
         let port = std::env::var("UAV_TEST_SERIAL_PORT")
@@ -943,6 +964,19 @@ mod tests {
         let heartbeat = wait_for_heartbeat(port, 115_200).expect("heartbeat should be received");
 
         eprintln!("hardware heartbeat: {heartbeat:?}");
+    }
+
+    #[test]
+    #[ignore = "requires a real non-MAVLink device and UAV_TEST_WRONG_DEVICE_PORT"]
+    fn rejects_non_mavlink_hardware_without_hanging() {
+        let port = std::env::var("UAV_TEST_WRONG_DEVICE_PORT")
+            .expect("UAV_TEST_WRONG_DEVICE_PORT must contain a serial device path");
+        let started_at = Instant::now();
+
+        let result = wait_for_heartbeat(port, 115_200);
+
+        assert!(result.is_err());
+        assert!(started_at.elapsed() < Duration::from_secs(7));
     }
 
     #[test]

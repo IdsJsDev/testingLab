@@ -1,12 +1,13 @@
+mod ammeter;
 mod flight_controller;
 mod parameter_file;
 mod status;
 
 use std::sync::Arc;
 
+use ammeter::{AmmeterManager, AmmeterSnapshot};
 use flight_controller::{
-    ControllerManager, HeartbeatInfo, ParameterSnapshot, ParameterWriteRequest,
-    ParameterWriteStatus, SerialPortDescriptor, TelemetrySnapshot,
+    ControllerManager, HeartbeatInfo, ParameterWriteRequest, SerialPortDescriptor,
 };
 use parameter_file::ParameterFileEntry;
 use status::CoreStatus;
@@ -48,24 +49,10 @@ async fn disconnect_flight_controller(
 }
 
 #[tauri::command]
-fn get_flight_controller_telemetry(
-    manager: State<'_, Arc<ControllerManager>>,
-) -> Option<TelemetrySnapshot> {
-    manager.latest_telemetry()
-}
-
-#[tauri::command]
 fn request_flight_controller_parameters(
     manager: State<'_, Arc<ControllerManager>>,
 ) -> Result<(), String> {
     manager.request_parameters()
-}
-
-#[tauri::command]
-fn get_flight_controller_parameters(
-    manager: State<'_, Arc<ControllerManager>>,
-) -> ParameterSnapshot {
-    manager.latest_parameters()
 }
 
 #[tauri::command]
@@ -90,8 +77,23 @@ fn write_flight_controller_parameters(
 }
 
 #[tauri::command]
-fn get_parameter_write_status(manager: State<'_, Arc<ControllerManager>>) -> ParameterWriteStatus {
-    manager.parameter_write_status()
+async fn connect_ammeter(
+    app: AppHandle,
+    manager: State<'_, Arc<AmmeterManager>>,
+    port_name: String,
+) -> Result<AmmeterSnapshot, String> {
+    let manager = Arc::clone(manager.inner());
+    tauri::async_runtime::spawn_blocking(move || manager.connect(app, port_name))
+        .await
+        .map_err(|error| format!("Задача подключения завершилась с ошибкой: {error}"))?
+}
+
+#[tauri::command]
+async fn disconnect_ammeter(manager: State<'_, Arc<AmmeterManager>>) -> Result<(), String> {
+    let manager = Arc::clone(manager.inner());
+    tauri::async_runtime::spawn_blocking(move || manager.disconnect())
+        .await
+        .map_err(|error| format!("Задача отключения завершилась с ошибкой: {error}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -99,18 +101,18 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(ControllerManager::default()))
+        .manage(Arc::new(AmmeterManager::default()))
         .invoke_handler(tauri::generate_handler![
             get_core_status,
             scan_serial_ports,
             connect_flight_controller,
             disconnect_flight_controller,
-            get_flight_controller_telemetry,
             request_flight_controller_parameters,
-            get_flight_controller_parameters,
             save_mission_planner_parameter_file,
             load_mission_planner_parameter_file,
             write_flight_controller_parameters,
-            get_parameter_write_status
+            connect_ammeter,
+            disconnect_ammeter
         ])
         .run(tauri::generate_context!())
         .expect("failed to run UAV Test Station");
