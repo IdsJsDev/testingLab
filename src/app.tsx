@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useEffect, useState } from "preact/hooks";
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
+import { useEffect, useRef, useState } from "preact/hooks";
 
 type Tab = {
   id: string;
@@ -66,6 +67,17 @@ type ParameterSnapshot = {
   loading: boolean;
 };
 
+type ParameterFileEntry = { name: string; value: number };
+type ParameterDifference = ParameterFileEntry & { currentValue?: number; selected: boolean };
+type ParameterWriteStatus = {
+  active: boolean;
+  total: number;
+  completed: number;
+  failed: number;
+  currentName?: string;
+  lastError?: string;
+};
+
 type ConnectionCardProps = {
   label: string;
   description: string;
@@ -115,6 +127,13 @@ export function App() {
   const [parameters, setParameters] = useState<ParameterSnapshot | null>(null);
   const [parameterSearch, setParameterSearch] = useState("");
   const [parameterError, setParameterError] = useState<string | null>(null);
+  const [comparisonFile, setComparisonFile] = useState<string | null>(null);
+  const [parameterDifferences, setParameterDifferences] = useState<ParameterDifference[]>([]);
+  const [stagedChanges, setStagedChanges] = useState<Record<string, number>>({});
+  const [writeStatus, setWriteStatus] = useState<ParameterWriteStatus | null>(null);
+  const wasWriting = useRef(false);
+  const [editingParameter, setEditingParameter] = useState<string | null>(null);
+  const [editingValue, setEditingValue] = useState("");
 
   const scanPorts = () => {
     if (!isTauriRuntime) {
@@ -212,7 +231,24 @@ export function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeTab, heartbeat]);
+  }, [activeTab, heartbeat?.portName]);
+
+  useEffect(() => {
+    if (!isTauriRuntime || activeTab !== "parameters") return;
+    const timer = window.setInterval(() => {
+      invoke<ParameterWriteStatus>("get_parameter_write_status").then((status) => {
+        setWriteStatus(status);
+        if (status.active) wasWriting.current = true;
+        if (wasWriting.current && !status.active && status.total > 0 && status.completed + status.failed >= status.total) {
+          wasWriting.current = false;
+          if (status.failed === 0) {
+            setStagedChanges({});
+          }
+        }
+      });
+    }, 300);
+    return () => window.clearInterval(timer);
+  }, [activeTab]);
 
   const connectFlightController = () => {
     if (!selectedPort) return;
@@ -281,6 +317,92 @@ export function App() {
         return groups;
       }, {}),
   ).sort(([left], [right]) => left.localeCompare(right));
+
+  const saveParameterBackup = async () => {
+    if (!parameters?.items.length) return;
+    try {
+      setParameterError(null);
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const path = await save({
+        defaultPath: `uav-parameters-${stamp}.param`,
+        filters: [{ name: "Mission Planner parameters", extensions: ["param", "parm"] }],
+      });
+      if (!path) return;
+      await invoke("save_mission_planner_parameter_file", {
+        path,
+        entries: parameters.items.map(({ name, value }) => ({ name, value })),
+      });
+    } catch (error) {
+      setParameterError(String(error));
+    }
+  };
+
+  const compareParameterFile = async () => {
+    try {
+      setParameterError(null);
+      const path = await open({
+        multiple: false,
+        filters: [{ name: "Mission Planner parameters", extensions: ["param", "parm"] }],
+      });
+      if (!path || Array.isArray(path)) return;
+      const entries = await invoke<ParameterFileEntry[]>("load_mission_planner_parameter_file", { path });
+      const current = new Map((parameters?.items ?? []).map((item) => [item.name, item.value]));
+      setParameterDifferences(entries
+        .filter((entry) => current.get(entry.name) === undefined || Math.abs((current.get(entry.name) ?? 0) - entry.value) > 0.00001)
+        .map((entry) => ({ ...entry, currentValue: current.get(entry.name), selected: false })));
+      setComparisonFile(path.split(/[\\/]/).pop() ?? path);
+    } catch (error) {
+      setParameterError(String(error));
+    }
+  };
+
+  const stageSelectedDifferences = () => {
+    setStagedChanges((current) => {
+      const next = { ...current };
+      parameterDifferences.filter((item) => item.selected && item.currentValue !== undefined)
+        .forEach((item) => { next[item.name] = item.value; });
+      return next;
+    });
+    setComparisonFile(null);
+    setParameterDifferences([]);
+  };
+
+  const writeStagedParameters = async () => {
+    const requests = Object.entries(stagedChanges).map(([name, value]) => ({ name, value }));
+    if (!requests.length) return;
+    const approved = await confirm(
+      `Записать ${requests.length} параметров в полётный контроллер? Каждый параметр будет проверен ответом контроллера.`,
+      { title: "Подтверждение записи", kind: "warning" },
+    );
+    if (!approved) return;
+    try {
+      setParameterError(null);
+      // A fast controller can acknowledge the write before the first status poll.
+      // Mark the operation here so its completed state is still handled.
+      wasWriting.current = true;
+      await invoke("write_flight_controller_parameters", { requests });
+    } catch (error) {
+      wasWriting.current = false;
+      setParameterError(String(error));
+    }
+  };
+
+  const applyParameterEdit = (parameter: ParameterValue) => {
+    const value = Number(editingValue.replace(",", "."));
+    if (!Number.isFinite(value)) {
+      setParameterError(`Некорректное значение для ${parameter.name}`);
+      return;
+    }
+    setStagedChanges((current) => {
+      const next = { ...current };
+      if (Math.abs(value - parameter.value) <= 0.00001) delete next[parameter.name];
+      else next[parameter.name] = value;
+      return next;
+    });
+    setParameterError(null);
+    setEditingParameter(null);
+    setEditingValue("");
+  };
 
   return (
     <div class="app-shell">
@@ -457,10 +579,53 @@ export function App() {
 
               <section class="parameter-toolbar">
                 <input type="search" value={parameterSearch} placeholder="Поиск по имени параметра" onInput={(event) => setParameterSearch(event.currentTarget.value)} />
+                <button type="button" onClick={saveParameterBackup}>Сохранить backup</button>
+                <button type="button" onClick={compareParameterFile}>Сравнить файл</button>
                 <button type="button" onClick={() => invoke("request_flight_controller_parameters")}>Обновить</button>
+                {Object.keys(stagedChanges).length > 0 && (
+                  <>
+                    <button class="primary-button" type="button" disabled={writeStatus?.active || parameters?.loading} onClick={writeStagedParameters}>
+                      Записать · {Object.keys(stagedChanges).length}
+                    </button>
+                    <button type="button" disabled={writeStatus?.active} onClick={() => setStagedChanges({})}>Отменить</button>
+                  </>
+                )}
               </section>
               {parameterError && <p class="connection-error">{parameterError}</p>}
+              {writeStatus?.active && <p class="write-status">Запись {writeStatus.completed + writeStatus.failed} / {writeStatus.total} · {writeStatus.currentName}</p>}
+              {!writeStatus?.active && writeStatus?.failed ? <p class="connection-error">Не записано: {writeStatus.failed}. {writeStatus.lastError}</p> : null}
             </div>
+
+            {comparisonFile && (
+              <section class="parameter-comparison">
+                <div class="comparison-heading">
+                  <div>
+                    <p class="eyebrow">Сравнение · {comparisonFile}</p>
+                    <h2>{parameterDifferences.length} отличий</h2>
+                  </div>
+                  <div class="comparison-actions">
+                    <button type="button" onClick={() => setParameterDifferences((items) => items.map((item) => ({ ...item, selected: true })))}>Выбрать все</button>
+                    <button type="button" disabled={!parameterDifferences.some((item) => item.selected && item.currentValue !== undefined)} onClick={stageSelectedDifferences}>Подготовить к записи</button>
+                    <button type="button" onClick={() => { setComparisonFile(null); setParameterDifferences([]); }}>Закрыть</button>
+                  </div>
+                </div>
+                <div class="comparison-list">
+                  {parameterDifferences.map((difference, index) => (
+                    <label key={difference.name}>
+                      <input
+                        type="checkbox"
+                        checked={difference.selected}
+                        onChange={(event) => setParameterDifferences((items) => items.map((item, itemIndex) => itemIndex === index ? { ...item, selected: event.currentTarget.checked } : item))}
+                      />
+                      <strong>{difference.name}</strong>
+                      <span>{difference.currentValue ?? "нет в контроллере"}</span>
+                      <span>→</span>
+                      <span>{difference.value}</span>
+                    </label>
+                  ))}
+                </div>
+              </section>
+            )}
             <section class="parameter-groups" aria-label="Параметры прошивки">
               {parameterGroups.map(([group, items]) => (
                 <details class="parameter-group" key={group} open={normalizedParameterSearch.length > 0 || undefined}>
@@ -475,9 +640,42 @@ export function App() {
                     {items.map((parameter) => (
                       <div class="parameter-row" key={parameter.index}>
                         <strong>{parameter.name}</strong>
-                        <span>{parameter.value}</span>
+                        {editingParameter === parameter.name ? (
+                          <input
+                            class="parameter-value editing"
+                            type="text"
+                            inputMode="decimal"
+                            value={editingValue}
+                            autofocus
+                            onInput={(event) => setEditingValue(event.currentTarget.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") applyParameterEdit(parameter);
+                              if (event.key === "Escape") setEditingParameter(null);
+                            }}
+                          />
+                        ) : (
+                          <span class={stagedChanges[parameter.name] !== undefined ? "parameter-display modified" : "parameter-display"}>
+                            {stagedChanges[parameter.name] ?? parameter.value}
+                          </span>
+                        )}
                         <span>{parameter.parameterType.replace("MAV_PARAM_TYPE_", "")}</span>
-                        <button type="button" disabled title="Запись будет включена после проверки чтения">Изменить</button>
+                        {editingParameter === parameter.name ? (
+                          <div class="parameter-edit-actions">
+                            <button class="primary-button" type="button" onClick={() => applyParameterEdit(parameter)}>Применить</button>
+                            <button type="button" onClick={() => setEditingParameter(null)}>Отмена</button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={writeStatus?.active}
+                            onClick={() => {
+                              setEditingParameter(parameter.name);
+                              setEditingValue(String(stagedChanges[parameter.name] ?? parameter.value));
+                            }}
+                          >
+                            {stagedChanges[parameter.name] !== undefined ? "Исправить" : "Изменить"}
+                          </button>
+                        )}
                       </div>
                     ))}
                   </div>

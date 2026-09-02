@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::BufReader;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use mavlink::MavHeader;
 use mavlink::dialects::ardupilotmega::{
-    COMMAND_LONG_DATA, MavAutopilot, MavCmd, MavMessage, MavModeFlag, PARAM_REQUEST_LIST_DATA,
+    COMMAND_LONG_DATA, MavAutopilot, MavCmd, MavMessage, MavModeFlag, MavParamType,
+    PARAM_REQUEST_LIST_DATA, PARAM_SET_DATA,
 };
 use mavlink::peek_reader::PeekReader;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serialport::{SerialPortInfo, SerialPortType};
 use tauri::{AppHandle, Emitter};
 
@@ -128,8 +129,27 @@ pub struct ParameterSnapshot {
     pub loading: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParameterWriteRequest {
+    pub name: String,
+    pub value: f32,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParameterWriteStatus {
+    pub active: bool,
+    pub total: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub current_name: Option<String>,
+    pub last_error: Option<String>,
+}
+
 enum WorkerCommand {
     RequestParameters,
+    WriteParameters(Vec<ParameterWriteRequest>),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,6 +171,7 @@ pub struct ControllerManager {
     session: Mutex<Option<ControllerSession>>,
     latest_telemetry: Arc<Mutex<Option<TelemetrySnapshot>>>,
     latest_parameters: Arc<Mutex<ParameterSnapshot>>,
+    parameter_write_status: Arc<Mutex<ParameterWriteStatus>>,
 }
 
 impl ControllerManager {
@@ -166,6 +187,7 @@ impl ControllerManager {
         let worker_stop = Arc::clone(&stop);
         let worker_telemetry = Arc::clone(&self.latest_telemetry);
         let worker_parameters = Arc::clone(&self.latest_parameters);
+        let worker_write_status = Arc::clone(&self.parameter_write_status);
         *worker_telemetry
             .lock()
             .expect("controller telemetry lock poisoned") = None;
@@ -179,6 +201,7 @@ impl ControllerManager {
                 worker_stop,
                 worker_telemetry,
                 worker_parameters,
+                worker_write_status,
                 worker_commands,
                 first_heartbeat_tx,
             );
@@ -226,6 +249,10 @@ impl ControllerManager {
             .latest_parameters
             .lock()
             .expect("controller parameters lock poisoned") = ParameterSnapshot::default();
+        *self
+            .parameter_write_status
+            .lock()
+            .expect("parameter write status lock poisoned") = ParameterWriteStatus::default();
     }
 
     pub fn latest_telemetry(&self) -> Option<TelemetrySnapshot> {
@@ -261,6 +288,47 @@ impl ControllerManager {
         self.latest_parameters
             .lock()
             .expect("controller parameters lock poisoned")
+            .clone()
+    }
+
+    pub fn write_parameters(&self, requests: Vec<ParameterWriteRequest>) -> Result<(), String> {
+        if requests.is_empty() || requests.len() > 200 {
+            return Err("Выберите от 1 до 200 параметров".to_owned());
+        }
+        let parameters = self
+            .latest_parameters
+            .lock()
+            .expect("controller parameters lock poisoned");
+        for request in &requests {
+            if !request.value.is_finite()
+                || !parameters
+                    .items
+                    .iter()
+                    .any(|item| item.name == request.name)
+            {
+                return Err(format!(
+                    "Некорректный или неизвестный параметр {}",
+                    request.name
+                ));
+            }
+        }
+        drop(parameters);
+        let session = self
+            .session
+            .lock()
+            .expect("controller session lock poisoned");
+        session
+            .as_ref()
+            .ok_or_else(|| "Полётный контроллер не подключён".to_owned())?
+            .commands
+            .send(WorkerCommand::WriteParameters(requests))
+            .map_err(|_| "Сессия контроллера уже завершена".to_owned())
+    }
+
+    pub fn parameter_write_status(&self) -> ParameterWriteStatus {
+        self.parameter_write_status
+            .lock()
+            .expect("parameter write status lock poisoned")
             .clone()
     }
 }
@@ -317,6 +385,7 @@ fn run_session(
     stop: Arc<AtomicBool>,
     latest_telemetry: Arc<Mutex<Option<TelemetrySnapshot>>>,
     latest_parameters: Arc<Mutex<ParameterSnapshot>>,
+    parameter_write_status: Arc<Mutex<ParameterWriteStatus>>,
     commands: mpsc::Receiver<WorkerCommand>,
     first_heartbeat_tx: mpsc::SyncSender<Result<HeartbeatInfo, String>>,
 ) {
@@ -351,6 +420,10 @@ fn run_session(
     let mut telemetry_requested = false;
     let mut outbound_sequence = 0_u8;
     let mut parameters = BTreeMap::<u16, ParameterValue>::new();
+    let mut parameter_types = HashMap::<String, MavParamType>::new();
+    let mut write_queue = VecDeque::<ParameterWriteRequest>::new();
+    let mut awaiting_write: Option<(ParameterWriteRequest, Instant, u8)> = None;
+    let mut target = None;
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(command) = commands.try_recv() {
@@ -364,8 +437,29 @@ fn run_session(
                         parameters.clear();
                     }
                 }
+                WorkerCommand::WriteParameters(requests) => {
+                    write_queue = requests.into();
+                    awaiting_write = None;
+                    *parameter_write_status
+                        .lock()
+                        .expect("parameter write status lock poisoned") = ParameterWriteStatus {
+                        active: true,
+                        total: write_queue.len(),
+                        ..ParameterWriteStatus::default()
+                    };
+                }
             }
         }
+
+        process_parameter_write(
+            &mut writer,
+            &mut outbound_sequence,
+            target,
+            &parameter_types,
+            &mut write_queue,
+            &mut awaiting_write,
+            &parameter_write_status,
+        );
 
         match mavlink::read_any_msg::<MavMessage, _>(&mut reader) {
             Ok((header, message)) => {
@@ -373,18 +467,44 @@ fn run_session(
                 telemetry.message_count += 1;
                 update_telemetry(&mut telemetry, &message);
                 if let MavMessage::PARAM_VALUE(data) = &message {
+                    let parameter_name = data.param_id.to_str().unwrap_or("").to_owned();
                     let parameter = ParameterValue {
-                        name: data.param_id.to_str().unwrap_or("").to_owned(),
+                        name: parameter_name.clone(),
                         value: data.param_value,
                         parameter_type: format!("{:?}", data.param_type),
                         index: data.param_index,
                     };
-                    parameters.insert(data.param_index, parameter);
+                    parameter_types.insert(parameter_name.clone(), data.param_type);
+                    let write_confirmed = awaiting_write
+                        .as_ref()
+                        .is_some_and(|(request, _, _)| request.name == parameter_name);
+                    let parameter = upsert_parameter_by_name(&mut parameters, parameter);
+                    if write_confirmed {
+                        awaiting_write = None;
+                        let mut status = parameter_write_status
+                            .lock()
+                            .expect("parameter write status lock poisoned");
+                        status.completed += 1;
+                        status.current_name = None;
+                        status.active = status.completed + status.failed < status.total;
+                    }
                     let refresh_received_count = parameters.len();
                     let refresh_complete = refresh_received_count >= usize::from(data.param_count);
                     let mut snapshot = latest_parameters
                         .lock()
                         .expect("controller parameters lock poisoned");
+
+                    // PARAM_SET is acknowledged with PARAM_VALUE. Apply that confirmed
+                    // value directly to the cached list instead of requesting all
+                    // parameters again after a point update.
+                    if write_confirmed
+                        && let Some(cached) = snapshot
+                            .items
+                            .iter_mut()
+                            .find(|item| item.name == parameter_name)
+                    {
+                        *cached = parameter.clone();
+                    }
 
                     // Keep the previous complete list visible while a refresh is in progress.
                     // During the first load there is no cache, so partial results are useful.
@@ -415,6 +535,7 @@ fn run_session(
                         mavlink_version: heartbeat.mavlink_version,
                     };
                     last_heartbeat = Some(Instant::now());
+                    target = Some((header.system_id, header.component_id));
                     eprintln!(
                         "MAVLink heartbeat on {port_name}: {}:{}",
                         header.system_id, header.component_id
@@ -498,6 +619,24 @@ fn run_session(
     }
 }
 
+fn upsert_parameter_by_name(
+    parameters: &mut BTreeMap<u16, ParameterValue>,
+    mut parameter: ParameterValue,
+) -> ParameterValue {
+    // A PARAM_SET acknowledgement may carry a service index (often u16::MAX)
+    // instead of the index used in PARAM_REQUEST_LIST. Parameter names are the
+    // stable identity, so preserve the known index and remove stale duplicates.
+    let index = parameters
+        .iter()
+        .find_map(|(index, current)| (current.name == parameter.name).then_some(*index))
+        .unwrap_or(parameter.index);
+    parameters
+        .retain(|current_index, current| current.name != parameter.name || *current_index == index);
+    parameter.index = index;
+    parameters.insert(index, parameter.clone());
+    parameter
+}
+
 fn request_parameter_list(
     writer: &mut Box<dyn serialport::SerialPort>,
     target_system: u8,
@@ -515,6 +654,120 @@ fn request_parameter_list(
     };
     mavlink::write_v2_msg(writer, header, &request)
         .map_err(|error| format!("Не удалось отправить PARAM_REQUEST_LIST: {error}"))?;
+    *sequence = sequence.wrapping_add(1);
+    Ok(())
+}
+
+fn process_parameter_write(
+    writer: &mut Box<dyn serialport::SerialPort>,
+    sequence: &mut u8,
+    target: Option<(u8, u8)>,
+    parameter_types: &HashMap<String, MavParamType>,
+    queue: &mut VecDeque<ParameterWriteRequest>,
+    awaiting: &mut Option<(ParameterWriteRequest, Instant, u8)>,
+    shared_status: &Arc<Mutex<ParameterWriteStatus>>,
+) {
+    let Some((target_system, target_component)) = target else {
+        return;
+    };
+
+    if let Some((request, sent_at, attempts)) = awaiting.as_mut() {
+        if sent_at.elapsed() < Duration::from_millis(900) {
+            return;
+        }
+        if *attempts >= 3 {
+            let failed_name = request.name.clone();
+            *awaiting = None;
+            let mut status = shared_status
+                .lock()
+                .expect("parameter write status lock poisoned");
+            status.failed += 1;
+            status.last_error = Some(format!("Контроллер не подтвердил {failed_name}"));
+            status.current_name = None;
+            status.active = status.completed + status.failed < status.total;
+            return;
+        }
+        if let Some(parameter_type) = parameter_types.get(&request.name).copied()
+            && send_parameter_set(
+                writer,
+                sequence,
+                target_system,
+                target_component,
+                request,
+                parameter_type,
+            )
+            .is_ok()
+        {
+            *sent_at = Instant::now();
+            *attempts += 1;
+        }
+        return;
+    }
+
+    let Some(request) = queue.pop_front() else {
+        let mut status = shared_status
+            .lock()
+            .expect("parameter write status lock poisoned");
+        if status.completed + status.failed >= status.total {
+            status.active = false;
+        }
+        return;
+    };
+    let Some(parameter_type) = parameter_types.get(&request.name).copied() else {
+        let mut status = shared_status
+            .lock()
+            .expect("parameter write status lock poisoned");
+        status.failed += 1;
+        status.last_error = Some(format!("Неизвестен MAVLink-тип {}", request.name));
+        return;
+    };
+    match send_parameter_set(
+        writer,
+        sequence,
+        target_system,
+        target_component,
+        &request,
+        parameter_type,
+    ) {
+        Ok(()) => {
+            shared_status
+                .lock()
+                .expect("parameter write status lock poisoned")
+                .current_name = Some(request.name.clone());
+            *awaiting = Some((request, Instant::now(), 1));
+        }
+        Err(error) => {
+            let mut status = shared_status
+                .lock()
+                .expect("parameter write status lock poisoned");
+            status.failed += 1;
+            status.last_error = Some(error);
+        }
+    }
+}
+
+fn send_parameter_set(
+    writer: &mut Box<dyn serialport::SerialPort>,
+    sequence: &mut u8,
+    target_system: u8,
+    target_component: u8,
+    request: &ParameterWriteRequest,
+    parameter_type: MavParamType,
+) -> Result<(), String> {
+    let message = MavMessage::PARAM_SET(PARAM_SET_DATA {
+        param_value: request.value,
+        target_system,
+        target_component,
+        param_id: request.name.as_str().into(),
+        param_type: parameter_type,
+    });
+    let header = MavHeader {
+        system_id: 255,
+        component_id: 190,
+        sequence: *sequence,
+    };
+    mavlink::write_v2_msg(writer, header, &message)
+        .map_err(|error| format!("Не удалось записать {}: {error}", request.name))?;
     *sequence = sequence.wrapping_add(1);
     Ok(())
 }
@@ -631,6 +884,7 @@ fn update_telemetry(snapshot: &mut TelemetrySnapshot, message: &MavMessage) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::BufReader;
     use std::time::{Duration, Instant};
 
@@ -638,8 +892,9 @@ mod tests {
     use mavlink::peek_reader::PeekReader;
 
     use super::{
-        READ_TIMEOUT, SerialPortDescriptor, SerialPortInfo, SerialPortType, request_parameter_list,
-        request_telemetry_messages, wait_for_heartbeat,
+        ParameterValue, ParameterWriteRequest, READ_TIMEOUT, SerialPortDescriptor, SerialPortInfo,
+        SerialPortType, request_parameter_list, request_telemetry_messages, send_parameter_set,
+        upsert_parameter_by_name, wait_for_heartbeat,
     };
 
     #[test]
@@ -651,6 +906,33 @@ mod tests {
 
         assert_eq!(descriptor.name, "test-port");
         assert_eq!(descriptor.kind, "unknown");
+    }
+
+    #[test]
+    fn parameter_ack_replaces_cached_value_by_name() {
+        let mut parameters = BTreeMap::from([(
+            42,
+            ParameterValue {
+                name: "TEST_PARAM".to_owned(),
+                value: 1.0,
+                parameter_type: "MAV_PARAM_TYPE_REAL32".to_owned(),
+                index: 42,
+            },
+        )]);
+
+        let confirmed = upsert_parameter_by_name(
+            &mut parameters,
+            ParameterValue {
+                name: "TEST_PARAM".to_owned(),
+                value: 2.0,
+                parameter_type: "MAV_PARAM_TYPE_REAL32".to_owned(),
+                index: u16::MAX,
+            },
+        );
+
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(confirmed.index, 42);
+        assert_eq!(parameters.get(&42).unwrap().value, 2.0);
     }
 
     #[test]
@@ -761,5 +1043,113 @@ mod tests {
         assert!(expected > 0, "controller did not report parameter count");
         assert_eq!(names.len(), usize::from(expected));
         assert!(names.iter().all(|name| !name.is_empty()));
+    }
+
+    #[test]
+    #[ignore = "writes and restores GCS_PID_MASK on real hardware"]
+    fn writes_and_restores_parameter_on_hardware() {
+        let port_name = std::env::var("UAV_TEST_SERIAL_PORT")
+            .expect("UAV_TEST_SERIAL_PORT must contain a serial device path");
+        let port = serialport::new(&port_name, 115_200)
+            .timeout(READ_TIMEOUT)
+            .open()
+            .expect("serial port should open");
+        let mut writer = port.try_clone().expect("serial port should clone");
+        let mut reader = PeekReader::new(BufReader::new(port));
+        let mut sequence = 0;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut target = None;
+        let mut original = None;
+
+        while Instant::now() < deadline && original.is_none() {
+            let Ok((header, message)) = mavlink::read_any_msg::<MavMessage, _>(&mut reader) else {
+                continue;
+            };
+            if matches!(message, MavMessage::HEARTBEAT(_)) && target.is_none() {
+                target = Some((header.system_id, header.component_id));
+                request_parameter_list(
+                    &mut writer,
+                    header.system_id,
+                    header.component_id,
+                    &mut sequence,
+                )
+                .expect("parameter request should be sent");
+            }
+            if let MavMessage::PARAM_VALUE(data) = message
+                && data.param_id.to_str().unwrap_or("") == "GCS_PID_MASK"
+            {
+                original = Some((data.param_value, data.param_type));
+            }
+        }
+
+        let (target_system, target_component) = target.expect("heartbeat should be received");
+        let (original_value, parameter_type) = original.expect("GCS_PID_MASK should be received");
+        let changed_value = if original_value.abs() < 0.5 { 1.0 } else { 0.0 };
+        let changed = ParameterWriteRequest {
+            name: "GCS_PID_MASK".to_owned(),
+            value: changed_value,
+        };
+        send_parameter_set(
+            &mut writer,
+            &mut sequence,
+            target_system,
+            target_component,
+            &changed,
+            parameter_type,
+        )
+        .expect("changed value should be sent");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut confirmed_changed = false;
+        while Instant::now() < deadline {
+            let Ok((_, message)) = mavlink::read_any_msg::<MavMessage, _>(&mut reader) else {
+                continue;
+            };
+            if let MavMessage::PARAM_VALUE(data) = message
+                && data.param_id.to_str().unwrap_or("") == "GCS_PID_MASK"
+                && (data.param_value - changed_value).abs() < 0.001
+            {
+                confirmed_changed = true;
+                break;
+            }
+        }
+
+        let restore = ParameterWriteRequest {
+            name: "GCS_PID_MASK".to_owned(),
+            value: original_value,
+        };
+        send_parameter_set(
+            &mut writer,
+            &mut sequence,
+            target_system,
+            target_component,
+            &restore,
+            parameter_type,
+        )
+        .expect("original value should be restored");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut confirmed_restored = false;
+        while Instant::now() < deadline {
+            let Ok((_, message)) = mavlink::read_any_msg::<MavMessage, _>(&mut reader) else {
+                continue;
+            };
+            if let MavMessage::PARAM_VALUE(data) = message
+                && data.param_id.to_str().unwrap_or("") == "GCS_PID_MASK"
+                && (data.param_value - original_value).abs() < 0.001
+            {
+                confirmed_restored = true;
+                break;
+            }
+        }
+
+        assert!(
+            confirmed_changed,
+            "controller did not confirm changed value"
+        );
+        assert!(
+            confirmed_restored,
+            "controller did not confirm restored value"
+        );
     }
 }

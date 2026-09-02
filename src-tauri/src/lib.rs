@@ -1,11 +1,14 @@
 mod flight_controller;
+mod parameter_file;
 mod status;
 
 use std::sync::Arc;
 
 use flight_controller::{
-    ControllerManager, HeartbeatInfo, ParameterSnapshot, SerialPortDescriptor, TelemetrySnapshot,
+    ControllerManager, HeartbeatInfo, ParameterSnapshot, ParameterWriteRequest,
+    ParameterWriteStatus, SerialPortDescriptor, TelemetrySnapshot,
 };
+use parameter_file::ParameterFileEntry;
 use status::CoreStatus;
 use tauri::{AppHandle, State};
 
@@ -65,9 +68,36 @@ fn get_flight_controller_parameters(
     manager.latest_parameters()
 }
 
+#[tauri::command]
+fn save_mission_planner_parameter_file(
+    path: String,
+    entries: Vec<ParameterFileEntry>,
+) -> Result<(), String> {
+    parameter_file::save(std::path::Path::new(&path), &entries)
+}
+
+#[tauri::command]
+fn load_mission_planner_parameter_file(path: String) -> Result<Vec<ParameterFileEntry>, String> {
+    parameter_file::load(std::path::Path::new(&path))
+}
+
+#[tauri::command]
+fn write_flight_controller_parameters(
+    manager: State<'_, Arc<ControllerManager>>,
+    requests: Vec<ParameterWriteRequest>,
+) -> Result<(), String> {
+    manager.write_parameters(requests)
+}
+
+#[tauri::command]
+fn get_parameter_write_status(manager: State<'_, Arc<ControllerManager>>) -> ParameterWriteStatus {
+    manager.parameter_write_status()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(ControllerManager::default()))
         .invoke_handler(tauri::generate_handler![
             get_core_status,
@@ -76,7 +106,11 @@ pub fn run() {
             disconnect_flight_controller,
             get_flight_controller_telemetry,
             request_flight_controller_parameters,
-            get_flight_controller_parameters
+            get_flight_controller_parameters,
+            save_mission_planner_parameter_file,
+            load_mission_planner_parameter_file,
+            write_flight_controller_parameters,
+            get_parameter_write_status
         ])
         .run(tauri::generate_context!())
         .expect("failed to run UAV Test Station");

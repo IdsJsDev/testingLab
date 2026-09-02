@@ -447,6 +447,14 @@ h1 {
   background: #08100f;
 }
 
+.parameter-sticky-header .connection-error {
+  margin: 6px 0;
+  padding: 7px 10px;
+  border: 1px solid #663b34;
+  border-radius: 7px;
+  background: #241513;
+}
+
 .parameter-title {
   display: flex;
   flex: 1;
@@ -474,6 +482,7 @@ h1 {
 
 .parameter-toolbar {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 8px;
 }
@@ -487,6 +496,12 @@ h1 {
   color: #d9e8e4;
   background: #0d1614;
   outline: none;
+}
+
+.write-status {
+  margin: 0 0 7px;
+  color: #65d4bc;
+  font-size: 11px;
 }
 
 .parameter-toolbar input:focus { border-color: #55cdb4; }
@@ -533,7 +548,7 @@ h1 {
 
 .parameter-row {
   display: grid;
-  grid-template-columns: minmax(160px, 1.4fr) minmax(100px, 1fr) minmax(90px, .8fr) 96px;
+  grid-template-columns: minmax(160px, 1.4fr) minmax(100px, 1fr) minmax(90px, .8fr) minmax(96px, auto);
   gap: 12px;
   align-items: center;
   min-width: 0;
@@ -547,6 +562,61 @@ h1 {
 .parameter-row strong { min-width: 0; color: #d2e1dd; overflow-wrap: anywhere; }
 .parameter-row button { padding: 7px 9px; font-size: 11px; }
 .parameter-header { color: #65d4bc; background: #111d1a; }
+
+.parameter-value {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: #9cacaa;
+  background: transparent;
+}
+
+.parameter-value:focus { border-color: #3d786b; outline: none; background: #101d1a; }
+.parameter-value.modified { border-color: #b48b45; color: #efd18d; background: #241f14; }
+.parameter-value.editing { border-color: #55c7ac; color: #d9e8e4; background: #101d1a; }
+
+.parameter-display {
+  min-width: 0;
+  padding: 7px 8px;
+  color: #9cacaa;
+  overflow-wrap: anywhere;
+}
+
+.parameter-display.modified {
+  border: 1px solid #b48b45;
+  border-radius: 6px;
+  color: #efd18d;
+  background: #241f14;
+}
+
+.parameter-edit-actions { display: flex; gap: 5px; }
+.parameter-edit-actions button { padding: 7px; }
+
+.parameter-comparison {
+  margin-bottom: 12px;
+  padding: 14px;
+  border: 1px solid #4c4228;
+  border-radius: 12px;
+  background: #171611;
+}
+
+.comparison-heading { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
+.comparison-heading h2 { margin: 0; font-size: 18px; }
+.comparison-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.comparison-list { display: grid; max-height: 280px; margin-top: 12px; overflow-y: auto; }
+.comparison-list label {
+  display: grid;
+  grid-template-columns: 20px minmax(140px, 1fr) minmax(90px, .7fr) 20px minmax(90px, .7fr);
+  gap: 8px;
+  align-items: center;
+  padding: 7px 5px;
+  border-top: 1px solid #2c2a21;
+  color: #9cacaa;
+  font-size: 12px;
+}
+.comparison-list strong { color: #d2e1dd; }
 
 @media (max-width: 780px) {
   .tabs {
