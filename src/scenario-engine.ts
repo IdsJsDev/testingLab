@@ -2,6 +2,9 @@ export type ScenarioContext = {
   controllerConnected: boolean;
   controllerName?: string;
   armed?: boolean;
+  controllerStatusText?: string;
+  rcChannels?: number[];
+  servo1OutputPwm?: number;
   ammeterConnected: boolean;
   ammeterCurrentA?: number;
   parameters: Array<{ name: string; value: number }>;
@@ -23,6 +26,8 @@ export type ScenarioBlock =
   | { id: string; type: "operatorConfirmation"; message: string }
   | { id: string; type: "resultMessage"; message: string }
   | { id: string; type: "prepareMotorTest"; maximumIdleCurrentA: number }
+  | { id: string; type: "armController"; force: boolean }
+  | { id: string; type: "disarmController" }
   | {
       id: string;
       type: "checkMotorRotation";
@@ -140,6 +145,18 @@ export const blockCatalog: BlockDefinition[] = [
     description:
       "Проверяет подключения полётного контроллера и амперметра, а также допустимый ток покоя перед замером двигателя.",
     create: (id) => ({ id, type: "prepareMotorTest", maximumIdleCurrentA: 1 }),
+  },
+  {
+    type: "armController",
+    label: "Выполнить ARM",
+    description: "Переводит контроллер в ARM и проверяет состояние по heartbeat.",
+    create: (id) => ({ id, type: "armController", force: false }),
+  },
+  {
+    type: "disarmController",
+    label: "Выполнить DISARM",
+    description: "Останавливает двигатель и переводит контроллер в DISARM.",
+    create: (id) => ({ id, type: "disarmController" }),
   },
   {
     type: "checkMotorRotation",

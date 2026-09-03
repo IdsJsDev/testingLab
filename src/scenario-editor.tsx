@@ -19,6 +19,12 @@ type RunEntry = {
   message: string;
 };
 type FreshParameter = { name: string; value: number };
+type MotorRotationCommand = {
+  throttleChannel: number;
+  inputPwm: number;
+  minimumInputPwm: number;
+  expectedServo1Pwm: number;
+};
 type Props = { context: ScenarioContext };
 type SavedScenario = {
   id: string;
@@ -33,7 +39,7 @@ type ScenarioFile = {
 };
 
 const STORAGE_KEY = "uav-test-station.scenarios.v1";
-const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v4";
+const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v8";
 const safetyConfirmation = {
   type: "operatorConfirmation" as const,
   message: "БПЛА закреплён, защитная зона свободна, аварийное отключение готово",
@@ -52,6 +58,11 @@ const motorTestTemplate: SavedScenario = {
     },
     {
       id: "motor-3",
+      type: "armController",
+      force: true,
+    },
+    {
+      id: "motor-4",
       type: "checkMotorRotation",
       throttlePercent: 10,
       durationSeconds: 2,
@@ -59,14 +70,14 @@ const motorTestTemplate: SavedScenario = {
       confirmation: "Пропеллер вращается в правильном направлении?",
     },
     {
-      id: "motor-4",
+      id: "motor-5",
       type: "measureMaximumCurrent",
       durationSeconds: 2,
       settlingSeconds: 0.5,
       emergencyCurrentA: 250,
     },
     {
-      id: "motor-5",
+      id: "motor-6",
       type: "tuneRcMaxByCurrent",
       parameterName: "RC1_MAX",
       targetCurrentA: 160,
@@ -76,7 +87,7 @@ const motorTestTemplate: SavedScenario = {
       cooldownSeconds: 5,
     },
     {
-      id: "motor-6",
+      id: "motor-7",
       type: "calibrateControllerCurrent",
       parameterName: "BATT_AMP_PERVLT",
       targetCurrentA: 20,
@@ -85,7 +96,8 @@ const motorTestTemplate: SavedScenario = {
       maximumDurationSeconds: 10,
       emergencyCurrentA: 40,
     },
-    { id: "motor-7", type: "resultMessage", message: "Тест двигателя завершён" },
+    { id: "motor-8", type: "disarmController" },
+    { id: "motor-9", type: "resultMessage", message: "Тест двигателя завершён" },
   ],
 };
 
@@ -97,15 +109,17 @@ const motorTestTemplates: SavedScenario[] = [
     blocks: [
       { id: "rotation-1", type: "prepareMotorTest", maximumIdleCurrentA: 1 },
       { id: "rotation-2", ...safetyConfirmation },
+      { id: "rotation-3", type: "armController", force: true },
       {
-        id: "rotation-3",
+        id: "rotation-4",
         type: "checkMotorRotation",
         throttlePercent: 10,
         durationSeconds: 2,
         emergencyCurrentA: 40,
         confirmation: "Пропеллер вращается в правильном направлении?",
       },
-      { id: "rotation-4", type: "resultMessage", message: "Направление вращения проверено" },
+      { id: "rotation-5", type: "disarmController" },
+      { id: "rotation-6", type: "resultMessage", message: "Направление вращения проверено" },
     ],
   },
   {
@@ -182,24 +196,17 @@ function loadScenarios(): SavedScenario[] {
     const scenarios = Array.isArray(value) ? (value as SavedScenario[]) : [];
     if (localStorage.getItem(TEMPLATE_SEEDED_KEY) !== "1") {
       localStorage.setItem(TEMPLATE_SEEDED_KEY, "1");
-      const migrated = scenarios.map((scenario) =>
-        scenario.id === motorTestTemplate.id
-          ? {
-              ...scenario,
-              blocks: scenario.blocks.map((block) => {
-                if (
-                  block.type === "checkMotorRotation" &&
-                  (block as { emergencyCurrentA?: number }).emergencyCurrentA === undefined
-                )
-                  return { ...block, emergencyCurrentA: 40 };
-                return (block.type === "measureMaximumCurrent" ||
-                  block.type === "tuneRcMaxByCurrent") &&
-                  block.emergencyCurrentA === 180
-                  ? { ...block, emergencyCurrentA: 250 }
-                  : block;
-              }),
-            }
-          : scenario,
+      const updatedBuiltIns = new Map(
+        motorTestTemplates
+          .filter(
+            (template) =>
+              template.id === "built-in-motor-rotation-v1" ||
+              template.id === motorTestTemplate.id,
+          )
+          .map((template) => [template.id, template]),
+      );
+      const migrated = scenarios.map(
+        (scenario) => updatedBuiltIns.get(scenario.id) ?? scenario,
       );
       const existingIds = new Set(migrated.map((item) => item.id));
       return [...motorTestTemplates.filter((item) => !existingIds.has(item.id)), ...migrated];
@@ -368,6 +375,20 @@ function Fields({
               replace({ ...block, maximumIdleCurrentA: e.currentTarget.valueAsNumber })
             }
           />
+        </label>
+      </div>
+    );
+  if (block.type === "armController")
+    return (
+      <div class="block-fields">
+        <label>
+          <input
+            disabled={disabled}
+            type="checkbox"
+            checked={block.force}
+            onChange={(e) => replace({ ...block, force: e.currentTarget.checked })}
+          />
+          Принудительный ARM — обойти pre-arm checks (только стенд без пропеллера)
         </label>
       </div>
     );
@@ -872,21 +893,103 @@ export function ScenarioEditor({ context }: Props) {
           if (!(await confirm(block.message, { title: `Сценарий: ${name}`, kind: "warning" })))
             throw new Error("Оператор не подтвердил действие");
           message = `Оператор подтвердил: ${block.message}`;
+        } else if (block.type === "armController") {
+          if (!latestContext.current.controllerConnected)
+            throw new Error("Полётный контроллер не подключён");
+          if (latestContext.current.armed === true) {
+            message = "Контроллер уже находится в состоянии ARM";
+          } else {
+            const previousStatusText = latestContext.current.controllerStatusText;
+            await invoke("set_flight_controller_armed", { armed: true, force: block.force });
+            const deadline = Date.now() + 5000;
+            while (!Boolean(latestContext.current.armed) && Date.now() < deadline) {
+              await new Promise((resolve) => window.setTimeout(resolve, 100));
+              if (cancelled.current) throw new Error(stopReason.current);
+            }
+            if (!Boolean(latestContext.current.armed)) {
+              const statusText = latestContext.current.controllerStatusText;
+              throw new Error(
+                statusText && statusText !== previousStatusText
+                  ? `Контроллер отклонил ARM: ${statusText}`
+                  : block.force
+                    ? "Контроллер отклонил даже принудительный ARM или не подтвердил его по heartbeat"
+                    : "Контроллер отклонил ARM или не подтвердил его по heartbeat. Проверьте сообщения pre-arm в Mission Planner",
+              );
+            }
+            message = "Контроллер подтвердил состояние ARM";
+          }
+        } else if (block.type === "disarmController") {
+          await invoke("emergency_stop_motor");
+          const deadline = Date.now() + 5000;
+          while (latestContext.current.armed !== false && Date.now() < deadline) {
+            await new Promise((resolve) => window.setTimeout(resolve, 100));
+          }
+          if (latestContext.current.armed !== false)
+            throw new Error(
+              `Контроллер не подтвердил принудительный DISARM по heartbeat; ARM=${latestContext.current.armed === true ? "да" : "неизвестно"}, сообщение=${latestContext.current.controllerStatusText ?? "нет"}`,
+            );
+          message = "Двигатель остановлен, контроллер подтвердил DISARM";
         } else if (block.type === "checkMotorRotation") {
+          if (latestContext.current.armed !== true)
+            throw new Error("Перед запуском двигателя контроллер должен находиться в ARM");
           motorActive.current = true;
           activeEmergencyCurrentA.current = block.emergencyCurrentA;
-          await invoke("start_motor_rotation", {
+          const motorCommand = await invoke<MotorRotationCommand>("start_motor_rotation", {
             throttlePercent: block.throttlePercent,
             durationSeconds: block.durationSeconds,
           });
           const deadline = Date.now() + block.durationSeconds * 1000 + 350;
+          const startedAt = Date.now();
+          let nextDiagnosticAt = startedAt;
+          const diagnostics: string[] = [];
+          let observedInputPwm: number | undefined;
+          let observedServo1Pwm: number | undefined;
           while (Date.now() < deadline) {
             await new Promise((resolve) => window.setTimeout(resolve, 50));
             if (cancelled.current) throw new Error(stopReason.current);
+            const input = latestContext.current.rcChannels?.[motorCommand.throttleChannel - 1];
+            if (
+              input !== undefined &&
+              input > 0 &&
+              (observedInputPwm === undefined ||
+                Math.abs(input - motorCommand.inputPwm) <
+                  Math.abs(observedInputPwm - motorCommand.inputPwm))
+            )
+              observedInputPwm = input;
+            const output = latestContext.current.servo1OutputPwm;
+            if (
+              output !== undefined &&
+              output > 0 &&
+              (observedServo1Pwm === undefined || output > observedServo1Pwm)
+            )
+              observedServo1Pwm = output;
+            if (Date.now() >= nextDiagnosticAt) {
+              const elapsedSeconds = (Date.now() - startedAt) / 1000;
+              const sample = `${elapsedSeconds.toFixed(1)}с: ARM=${latestContext.current.armed === true ? "да" : "нет"}, RC${motorCommand.throttleChannel}=${input ?? "—"}, SERVO1=${output ?? "—"}`;
+              diagnostics.push(sample);
+              updateEntry(block.id, {
+                message: `Газ ${block.throttlePercent}%: цель RC${motorCommand.throttleChannel}=${motorCommand.inputPwm}, SERVO1≈${motorCommand.expectedServo1Pwm} мкс. ${sample}`,
+              });
+              nextDiagnosticAt += 200;
+            }
           }
           await invoke("emergency_stop_motor");
           motorActive.current = false;
           activeEmergencyCurrentA.current = null;
+          if (
+            observedInputPwm === undefined ||
+            Math.abs(observedInputPwm - motorCommand.inputPwm) > 25
+          )
+            throw new Error(
+              `Контроллер не применил RC override: отправлено RC${motorCommand.throttleChannel}=${motorCommand.inputPwm} мкс, получено ${observedInputPwm ?? "нет данных"} мкс. Лог: ${diagnostics.join("; ")}`,
+            );
+          if (
+            observedServo1Pwm === undefined ||
+            observedServo1Pwm < motorCommand.expectedServo1Pwm - 40
+          )
+            throw new Error(
+              `Выход SERVO1 не достиг команды газа: ожидалось около ${motorCommand.expectedServo1Pwm} мкс, получено ${observedServo1Pwm ?? "нет данных"} мкс. Лог: ${diagnostics.join("; ")}`,
+            );
           if (
             !(await confirm(block.confirmation, {
               title: `Сценарий: ${name}`,
@@ -894,7 +997,7 @@ export function ScenarioEditor({ context }: Props) {
             }))
           )
             throw new Error("Направление вращения не подтверждено оператором");
-          message = `Двигатель работал ${block.durationSeconds} с на ${block.throttlePercent}% газа; направление подтверждено`;
+          message = `Двигатель: ${block.durationSeconds} с на ${block.throttlePercent}% газа; RC${motorCommand.throttleChannel}=${observedInputPwm} мкс, SERVO1=${observedServo1Pwm} мкс; направление подтверждено. Лог: ${diagnostics.join("; ")}`;
         } else if (block.type === "prepareMotorTest") {
           const current = latestContext.current;
           if (!current.controllerConnected) throw new Error("Полётный контроллер не подключён");

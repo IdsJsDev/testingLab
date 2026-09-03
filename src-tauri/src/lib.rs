@@ -16,6 +16,15 @@ use parameter_file::ParameterFileEntry;
 use status::CoreStatus;
 use tauri::{AppHandle, State};
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MotorRotationCommand {
+    throttle_channel: u8,
+    input_pwm: u16,
+    minimum_input_pwm: u16,
+    expected_servo1_pwm: u16,
+}
+
 #[tauri::command]
 fn get_core_status() -> CoreStatus {
     CoreStatus::disconnected()
@@ -103,30 +112,92 @@ fn write_flight_controller_parameters(
 }
 
 #[tauri::command]
-fn start_motor_rotation(
+async fn start_motor_rotation(
     manager: State<'_, Arc<ControllerManager>>,
     throttle_percent: f32,
     duration_seconds: f32,
-) -> Result<(), String> {
+) -> Result<MotorRotationCommand, String> {
+    let manager = Arc::clone(manager.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        start_motor_rotation_inner(&manager, throttle_percent, duration_seconds)
+    })
+    .await
+    .map_err(|error| format!("Задача запуска двигателя завершилась с ошибкой: {error}"))?
+}
+
+fn start_motor_rotation_inner(
+    manager: &ControllerManager,
+    throttle_percent: f32,
+    duration_seconds: f32,
+) -> Result<MotorRotationCommand, String> {
     if !throttle_percent.is_finite() || !(1.0..=30.0).contains(&throttle_percent) {
         return Err("Для проверки вращения разрешён газ от 1 до 30%".to_owned());
     }
     if !duration_seconds.is_finite() || !(0.1..=5.0).contains(&duration_seconds) {
         return Err("Проверка вращения должна длиться от 0.1 до 5 секунд".to_owned());
     }
-    let minimum_pwm = 1_000_u16;
-    let pwm = minimum_pwm + (throttle_percent * 10.0).round() as u16;
+    let parameters = manager.parameter_snapshot();
+    let read_parameter = |name: &str| -> Result<f32, String> {
+        if let Some(parameter) = parameters
+            .items
+            .iter()
+            .find(|parameter| parameter.name == name)
+        {
+            Ok(parameter.value)
+        } else {
+            manager
+                .read_parameter(name.to_owned())
+                .map(|parameter| parameter.value)
+        }
+    };
+    let throttle_channel = read_parameter("RCMAP_THROTTLE")?.round() as u8;
+    if !(1..=8).contains(&throttle_channel) {
+        return Err(format!(
+            "RCMAP_THROTTLE содержит недопустимый канал {throttle_channel}"
+        ));
+    }
+    let minimum_name = format!("RC{throttle_channel}_MIN");
+    let maximum_name = format!("RC{throttle_channel}_MAX");
+    let minimum_pwm = read_parameter(&minimum_name)?.round() as u16;
+    let maximum_pwm = read_parameter(&maximum_name)?.round() as u16;
+    if minimum_pwm >= maximum_pwm {
+        return Err(format!("Некорректные {minimum_name}/{maximum_name}"));
+    }
+    let pwm = minimum_pwm
+        + (f32::from(maximum_pwm - minimum_pwm) * throttle_percent / 100.0).round() as u16;
+    let servo1_minimum = read_parameter("SERVO1_MIN")?.round() as u16;
+    let servo1_maximum = read_parameter("SERVO1_MAX")?.round() as u16;
+    if servo1_minimum >= servo1_maximum {
+        return Err("Некорректные SERVO1_MIN/SERVO1_MAX".to_owned());
+    }
+    let expected_servo1_pwm = servo1_minimum
+        + (f32::from(servo1_maximum - servo1_minimum) * throttle_percent / 100.0).round() as u16;
     manager.start_rc_pulse(
-        1,
+        throttle_channel,
         pwm,
         minimum_pwm,
         std::time::Duration::from_secs_f32(duration_seconds),
-    )
+    )?;
+    Ok(MotorRotationCommand {
+        throttle_channel,
+        input_pwm: pwm,
+        minimum_input_pwm: minimum_pwm,
+        expected_servo1_pwm,
+    })
 }
 
 #[tauri::command]
 fn emergency_stop_motor(manager: State<'_, Arc<ControllerManager>>) -> Result<(), String> {
     manager.emergency_stop()
+}
+
+#[tauri::command]
+fn set_flight_controller_armed(
+    manager: State<'_, Arc<ControllerManager>>,
+    armed: bool,
+    force: bool,
+) -> Result<(), String> {
+    manager.set_armed(armed, force)
 }
 
 #[tauri::command]
@@ -196,6 +267,7 @@ pub fn run() {
             write_flight_controller_parameters,
             start_motor_rotation,
             emergency_stop_motor,
+            set_flight_controller_armed,
             connect_ammeter,
             disconnect_ammeter,
             get_mcp_status,

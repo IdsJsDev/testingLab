@@ -128,6 +128,7 @@ pub struct TelemetrySnapshot {
     pub armed: Option<bool>,
     pub custom_mode: Option<u32>,
     pub system_status: Option<String>,
+    pub status_text: Option<String>,
     pub cpu_load_percent: Option<f32>,
     pub battery_voltage_v: Option<f32>,
     pub battery_current_a: Option<f32>,
@@ -140,6 +141,7 @@ pub struct TelemetrySnapshot {
     pub rc_channels: Option<[u16; 18]>,
     pub rc_channel_count: Option<u8>,
     pub rc_rssi: Option<u8>,
+    pub servo1_output_pwm: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -195,6 +197,11 @@ enum WorkerCommand {
         reply: mpsc::SyncSender<Result<(), String>>,
     },
     EmergencyStop {
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    SetArmed {
+        armed: bool,
+        force: bool,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
 }
@@ -441,6 +448,24 @@ impl ControllerManager {
             .recv_timeout(Duration::from_secs(1))
             .map_err(|_| "Не получено подтверждение аварийной остановки".to_owned())?
     }
+
+    pub fn set_armed(&self, armed: bool, force: bool) -> Result<(), String> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.session
+            .lock()
+            .as_ref()
+            .ok_or_else(|| "Полётный контроллер не подключён".to_owned())?
+            .commands
+            .send(WorkerCommand::SetArmed {
+                armed,
+                force,
+                reply,
+            })
+            .map_err(|_| "Сессия контроллера уже завершена".to_owned())?;
+        response
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| "Контроллер не подтвердил отправку команды ARM/DISARM".to_owned())?
+    }
 }
 
 pub fn list_serial_ports() -> Result<Vec<SerialPortDescriptor>, String> {
@@ -603,6 +628,10 @@ fn run_session(
                     duration,
                     reply,
                 } => {
+                    eprintln!(
+                        "Motor RC override start: channel={channel}, pwm={pwm}, minimum={minimum_pwm}, duration_ms={}",
+                        duration.as_millis()
+                    );
                     let result = target
                         .ok_or_else(|| "Целевой контроллер ещё не определён".to_owned())
                         .and_then(|target| {
@@ -626,12 +655,45 @@ fn run_session(
                     let _ = reply.send(result);
                 }
                 WorkerCommand::EmergencyStop { reply } => {
-                    let result = stop_rc_override(
+                    eprintln!("Motor emergency stop: minimum override, release and DISARM");
+                    let stop_result = stop_rc_override(
                         &mut writer,
                         target,
                         active_rc_pulse.take(),
                         &mut outbound_sequence,
                     );
+                    let disarm_result = target
+                        .ok_or_else(|| "Целевой контроллер ещё не определён".to_owned())
+                        .and_then(|target| {
+                            for _ in 0..3 {
+                                send_arm_disarm(
+                                    &mut writer,
+                                    target,
+                                    false,
+                                    true,
+                                    &mut outbound_sequence,
+                                )?;
+                            }
+                            Ok(())
+                        });
+                    let _ = reply.send(stop_result.and(disarm_result));
+                }
+                WorkerCommand::SetArmed {
+                    armed,
+                    force,
+                    reply,
+                } => {
+                    let result = target
+                        .ok_or_else(|| "Целевой контроллер ещё не определён".to_owned())
+                        .and_then(|target| {
+                            send_arm_disarm(
+                                &mut writer,
+                                target,
+                                armed,
+                                force,
+                                &mut outbound_sequence,
+                            )
+                        });
                     let _ = reply.send(result);
                 }
             }
@@ -1060,11 +1122,12 @@ fn request_telemetry_messages(
     sequence: &mut u8,
     port_name: &str,
 ) -> bool {
-    // SYS_STATUS, GPS_RAW_INT, ATTITUDE, RC_CHANNELS and BATTERY_STATUS.
+    // SYS_STATUS, GPS_RAW_INT, ATTITUDE, SERVO_OUTPUT_RAW, RC_CHANNELS and BATTERY_STATUS.
     let requests = [
         (1_u32, 500_000_u32),
         (24, 500_000),
         (30, 200_000),
+        (36, 100_000),
         (65, 200_000),
         (147, 500_000),
     ];
@@ -1132,6 +1195,37 @@ fn send_rc_override(
     Ok(())
 }
 
+fn send_arm_disarm(
+    writer: &mut Box<dyn serialport::SerialPort>,
+    target: (u8, u8),
+    armed: bool,
+    force: bool,
+    sequence: &mut u8,
+) -> Result<(), String> {
+    let message = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        param1: if armed { 1.0 } else { 0.0 },
+        param2: if force { 21_196.0 } else { 0.0 },
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+        command: MavCmd::MAV_CMD_COMPONENT_ARM_DISARM,
+        target_system: target.0,
+        target_component: target.1,
+        confirmation: 0,
+    });
+    let header = MavHeader {
+        system_id: 255,
+        component_id: 190,
+        sequence: *sequence,
+    };
+    mavlink::write_v2_msg(writer, header, &message)
+        .map_err(|error| format!("Не удалось отправить команду ARM/DISARM: {error}"))?;
+    *sequence = sequence.wrapping_add(1);
+    Ok(())
+}
+
 fn stop_rc_override(
     writer: &mut Box<dyn serialport::SerialPort>,
     target: Option<(u8, u8)>,
@@ -1177,10 +1271,19 @@ fn update_telemetry(snapshot: &mut TelemetrySnapshot, message: &MavMessage) {
             snapshot.pitch_rad = Some(data.pitch);
             snapshot.yaw_rad = Some(data.yaw);
         }
+        MavMessage::SERVO_OUTPUT_RAW(data) => {
+            snapshot.servo1_output_pwm = Some(data.servo1_raw);
+        }
         MavMessage::GPS_RAW_INT(data) => {
             snapshot.gps_fix = Some(format!("{:?}", data.fix_type));
             snapshot.satellites_visible =
                 (data.satellites_visible != u8::MAX).then_some(data.satellites_visible);
+        }
+        MavMessage::STATUSTEXT(data) => {
+            let text = data.text.to_str().unwrap_or("").trim().to_owned();
+            if !text.is_empty() {
+                snapshot.status_text = Some(text);
+            }
         }
         MavMessage::RC_CHANNELS(data) => {
             snapshot.rc_channels = Some([
