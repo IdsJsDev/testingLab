@@ -1240,6 +1240,7 @@ export function App() {
               controllerStatusText: telemetry?.statusText,
               rcChannels: telemetry?.rcChannels,
               servo1OutputPwm: telemetry?.servo1OutputPwm,
+              controllerCurrentA: telemetry?.batteryCurrentA,
               ammeterConnected: ammeter !== null,
               ammeterCurrentA: ammeter?.currentAmps,
               parameters: parameters?.items ?? [],

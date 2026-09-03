@@ -25,6 +25,18 @@ type MotorRotationCommand = {
   minimumInputPwm: number;
   expectedServo1Pwm: number;
 };
+type RotationDecision = "correct" | "incorrect" | "notRotating" | "cancelled";
+type RotationPrompt = {
+  question: string;
+  throttlePercent: number;
+  rcChannel: number;
+  inputPwm: number;
+  servo1Pwm: number;
+  averageCurrentA?: number;
+  peakCurrentA?: number;
+  averageControllerCurrentA?: number;
+  peakControllerCurrentA?: number;
+};
 type Props = { context: ScenarioContext };
 type SavedScenario = {
   id: string;
@@ -39,7 +51,7 @@ type ScenarioFile = {
 };
 
 const STORAGE_KEY = "uav-test-station.scenarios.v1";
-const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v8";
+const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v9";
 const safetyConfirmation = {
   type: "operatorConfirmation" as const,
   message: "БПЛА закреплён, защитная зона свободна, аварийное отключение готово",
@@ -65,7 +77,7 @@ const motorTestTemplate: SavedScenario = {
       id: "motor-4",
       type: "checkMotorRotation",
       throttlePercent: 10,
-      durationSeconds: 2,
+      durationSeconds: 1,
       emergencyCurrentA: 40,
       confirmation: "Пропеллер вращается в правильном направлении?",
     },
@@ -114,7 +126,7 @@ const motorTestTemplates: SavedScenario[] = [
         id: "rotation-4",
         type: "checkMotorRotation",
         throttlePercent: 10,
-        durationSeconds: 2,
+        durationSeconds: 1,
         emergencyCurrentA: 40,
         confirmation: "Пропеллер вращается в правильном направлении?",
       },
@@ -408,15 +420,17 @@ function Fields({
         </label>
         <label>
           Длительность, с
-          <input
+          <select
             disabled={disabled}
-            type="number"
-            min="0.1"
-            max="5"
-            step="0.1"
             value={block.durationSeconds}
-            onInput={(e) => replace({ ...block, durationSeconds: e.currentTarget.valueAsNumber })}
-          />
+            onChange={(e) =>
+              replace({ ...block, durationSeconds: Number(e.currentTarget.value) })
+            }
+          >
+            {Array.from({ length: 10 }, (_, index) => (index + 1) / 2).map((seconds) => (
+              <option value={seconds}>{seconds.toLocaleString("ru-RU")}</option>
+            ))}
+          </select>
         </label>
         <label>
           Аварийный ток, A
@@ -639,11 +653,16 @@ export function ScenarioEditor({ context }: Props) {
   const cancelled = useRef(false);
   const motorActive = useRef(false);
   const activeEmergencyCurrentA = useRef<number | null>(null);
+  const rotationDecisionResolver = useRef<((value: RotationDecision) => void) | null>(null);
+  const [rotationPrompt, setRotationPrompt] = useState<RotationPrompt | null>(null);
   const stopReason = useRef("Остановлено оператором");
   const running = status === "running";
   const emergencyStop = async (reason = "Остановлено оператором") => {
     stopReason.current = reason;
     cancelled.current = true;
+    rotationDecisionResolver.current?.("cancelled");
+    rotationDecisionResolver.current = null;
+    setRotationPrompt(null);
     try {
       await invoke("emergency_stop_motor");
     } catch (error) {
@@ -652,6 +671,17 @@ export function ScenarioEditor({ context }: Props) {
       motorActive.current = false;
       activeEmergencyCurrentA.current = null;
     }
+  };
+  const requestRotationDecision = (prompt: RotationPrompt) =>
+    new Promise<RotationDecision>((resolve) => {
+      rotationDecisionResolver.current = resolve;
+      setRotationPrompt(prompt);
+    });
+  const answerRotationDecision = (decision: RotationDecision) => {
+    const resolve = rotationDecisionResolver.current;
+    rotationDecisionResolver.current = null;
+    setRotationPrompt(null);
+    resolve?.(decision);
   };
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(savedScenarios));
@@ -942,6 +972,8 @@ export function ScenarioEditor({ context }: Props) {
           const startedAt = Date.now();
           let nextDiagnosticAt = startedAt;
           const diagnostics: string[] = [];
+          const currentSamplesA: number[] = [];
+          const controllerCurrentSamplesA: number[] = [];
           let observedInputPwm: number | undefined;
           let observedServo1Pwm: number | undefined;
           while (Date.now() < deadline) {
@@ -963,9 +995,27 @@ export function ScenarioEditor({ context }: Props) {
               (observedServo1Pwm === undefined || output > observedServo1Pwm)
             )
               observedServo1Pwm = output;
+            const currentA = latestContext.current.ammeterCurrentA;
+            const controllerCurrentA = latestContext.current.controllerCurrentA;
+            if (
+              currentA !== undefined &&
+              Number.isFinite(currentA) &&
+              output !== undefined &&
+              output >= motorCommand.expectedServo1Pwm - 40 &&
+              Date.now() - startedAt <= block.durationSeconds * 1000
+            )
+              currentSamplesA.push(Math.abs(currentA));
+            if (
+              controllerCurrentA !== undefined &&
+              Number.isFinite(controllerCurrentA) &&
+              output !== undefined &&
+              output >= motorCommand.expectedServo1Pwm - 40 &&
+              Date.now() - startedAt <= block.durationSeconds * 1000
+            )
+              controllerCurrentSamplesA.push(Math.abs(controllerCurrentA));
             if (Date.now() >= nextDiagnosticAt) {
               const elapsedSeconds = (Date.now() - startedAt) / 1000;
-              const sample = `${elapsedSeconds.toFixed(1)}с: ARM=${latestContext.current.armed === true ? "да" : "нет"}, RC${motorCommand.throttleChannel}=${input ?? "—"}, SERVO1=${output ?? "—"}`;
+              const sample = `${elapsedSeconds.toFixed(1)}с: ARM=${latestContext.current.armed === true ? "да" : "нет"}, RC${motorCommand.throttleChannel}=${input ?? "—"}, SERVO1=${output ?? "—"}, FCA=${controllerCurrentA?.toFixed(2) ?? "—"} A, CA=${currentA?.toFixed(2) ?? "—"} A`;
               diagnostics.push(sample);
               updateEntry(block.id, {
                 message: `Газ ${block.throttlePercent}%: цель RC${motorCommand.throttleChannel}=${motorCommand.inputPwm}, SERVO1≈${motorCommand.expectedServo1Pwm} мкс. ${sample}`,
@@ -990,14 +1040,38 @@ export function ScenarioEditor({ context }: Props) {
             throw new Error(
               `Выход SERVO1 не достиг команды газа: ожидалось около ${motorCommand.expectedServo1Pwm} мкс, получено ${observedServo1Pwm ?? "нет данных"} мкс. Лог: ${diagnostics.join("; ")}`,
             );
-          if (
-            !(await confirm(block.confirmation, {
-              title: `Сценарий: ${name}`,
-              kind: "warning",
-            }))
-          )
-            throw new Error("Направление вращения не подтверждено оператором");
-          message = `Двигатель: ${block.durationSeconds} с на ${block.throttlePercent}% газа; RC${motorCommand.throttleChannel}=${observedInputPwm} мкс, SERVO1=${observedServo1Pwm} мкс; направление подтверждено. Лог: ${diagnostics.join("; ")}`;
+          const averageCurrentA = currentSamplesA.length
+            ? currentSamplesA.reduce((sum, value) => sum + value, 0) / currentSamplesA.length
+            : undefined;
+          const peakCurrentA = currentSamplesA.length
+            ? Math.max(...currentSamplesA)
+            : undefined;
+          const averageControllerCurrentA = controllerCurrentSamplesA.length
+            ? controllerCurrentSamplesA.reduce((sum, value) => sum + value, 0) /
+              controllerCurrentSamplesA.length
+            : undefined;
+          const peakControllerCurrentA = controllerCurrentSamplesA.length
+            ? Math.max(...controllerCurrentSamplesA)
+            : undefined;
+          const rotationDecision = await requestRotationDecision({
+            question: block.confirmation,
+            throttlePercent: block.throttlePercent,
+            rcChannel: motorCommand.throttleChannel,
+            inputPwm: observedInputPwm,
+            servo1Pwm: observedServo1Pwm,
+            averageCurrentA,
+            peakCurrentA,
+            averageControllerCurrentA,
+            peakControllerCurrentA,
+          });
+          if (rotationDecision === "cancelled") throw new Error(stopReason.current);
+          if (rotationDecision === "incorrect")
+            throw new Error(
+              `Двигатель вращался в неправильном направлении. Лог: ${diagnostics.join("; ")}`,
+            );
+          if (rotationDecision === "notRotating")
+            throw new Error(`Двигатель не вращался. Лог: ${diagnostics.join("; ")}`);
+          message = `Вращение подтверждено: газ ${block.throttlePercent}%, ${block.durationSeconds} с; FCA ${averageControllerCurrentA?.toFixed(2) ?? "нет данных"} A (пик ${peakControllerCurrentA?.toFixed(2) ?? "нет данных"} A); CA ${averageCurrentA?.toFixed(2) ?? "нет данных"} A (пик ${peakCurrentA?.toFixed(2) ?? "нет данных"} A)`;
         } else if (block.type === "prepareMotorTest") {
           const current = latestContext.current;
           if (!current.controllerConnected) throw new Error("Полётный контроллер не подключён");
@@ -1221,6 +1295,42 @@ export function ScenarioEditor({ context }: Props) {
           </div>
         </aside>
       </section>
+      {rotationPrompt && (
+        <div class="rotation-prompt-backdrop" role="presentation">
+          <section class="rotation-prompt" role="dialog" aria-modal="true">
+            <p class="eyebrow">Проверка оператором</p>
+            <h2>{rotationPrompt.question}</h2>
+            <p>
+              Газ {rotationPrompt.throttlePercent}% · RC{rotationPrompt.rcChannel}={rotationPrompt.inputPwm} мкс · SERVO1={rotationPrompt.servo1Pwm} мкс
+            </p>
+            <p>
+              FCA: средний {rotationPrompt.averageControllerCurrentA?.toFixed(2) ?? "нет данных"} A · пик {rotationPrompt.peakControllerCurrentA?.toFixed(2) ?? "нет данных"} A
+            </p>
+            <p>
+              CA: средний {rotationPrompt.averageCurrentA?.toFixed(2) ?? "нет данных"} A · пик {rotationPrompt.peakCurrentA?.toFixed(2) ?? "нет данных"} A
+            </p>
+            <div class="rotation-prompt-actions">
+              <button
+                type="button"
+                class="primary-button"
+                onClick={() => answerRotationDecision("correct")}
+              >
+                Вращался правильно
+              </button>
+              <button type="button" onClick={() => answerRotationDecision("incorrect")}>
+                Вращался неправильно
+              </button>
+              <button
+                type="button"
+                class="danger-button"
+                onClick={() => answerRotationDecision("notRotating")}
+              >
+                Не вращался
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </>
   );
 }

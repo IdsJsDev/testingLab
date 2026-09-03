@@ -35,6 +35,21 @@ describe("scenario validation", () => {
       validateScenario("Sound", [{ id: "1", type: "sound", repeats: 0, intervalSeconds: 1 }]),
     ).toEqual(["Блок 1: число звуков должно быть от 1 до 20"]);
   });
+
+  it("accepts motor rotation duration only in half-second steps", () => {
+    const rotation = (durationSeconds: number) => ({
+      id: "rotation",
+      type: "checkMotorRotation" as const,
+      throttlePercent: 10,
+      durationSeconds,
+      emergencyCurrentA: 40,
+      confirmation: "Направление правильное?",
+    });
+    expect(validateScenario("Rotation", [rotation(1.5)])).toEqual([]);
+    expect(validateScenario("Rotation", [rotation(0.7)])).toContain(
+      "Блок 1: запуск должен длиться от 0,5 до 5 секунд с шагом 0,5 секунды",
+    );
+  });
 });
 
 describe("immediate block evaluation", () => {

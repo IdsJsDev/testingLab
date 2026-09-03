@@ -5,6 +5,7 @@ export type ScenarioContext = {
   controllerStatusText?: string;
   rcChannels?: number[];
   servo1OutputPwm?: number;
+  controllerCurrentA?: number;
   ammeterConnected: boolean;
   ammeterCurrentA?: number;
   parameters: Array<{ name: string; value: number }>;
@@ -255,8 +256,12 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
     } else if (block.type === "checkMotorRotation") {
       if (block.throttlePercent <= 0 || block.throttlePercent > 30)
         errors.push(`${prefix}: малый газ должен быть от 1 до 30%`);
-      if (block.durationSeconds <= 0 || block.durationSeconds > 5)
-        errors.push(`${prefix}: запуск должен длиться от 0 до 5 секунд`);
+      if (
+        block.durationSeconds < 0.5 ||
+        block.durationSeconds > 5 ||
+        Math.abs(block.durationSeconds * 2 - Math.round(block.durationSeconds * 2)) > 1e-6
+      )
+        errors.push(`${prefix}: запуск должен длиться от 0,5 до 5 секунд с шагом 0,5 секунды`);
       if (!Number.isFinite(block.emergencyCurrentA) || block.emergencyCurrentA <= 0)
         errors.push(`${prefix}: укажите положительный аварийный ток`);
       if (!block.confirmation.trim()) errors.push(`${prefix}: укажите текст подтверждения`);
