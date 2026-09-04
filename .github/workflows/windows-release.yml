@@ -1,0 +1,93 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test -- --run
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Windows installers
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc
+
+      - name: Number and collect installers
+        id: release
+        shell: pwsh
+        run: |
+          $appVersion = node -p "require('./package.json').version"
+          $releaseNumber = "v$appVersion-build.${{ github.run_number }}"
+          $releaseDirectory = "release/windows"
+          New-Item -ItemType Directory -Force -Path $releaseDirectory | Out-Null
+
+          $bundles = Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle" -Recurse -File |
+            Where-Object { $_.Extension -in ".msi", ".exe" }
+
+          if (-not $bundles) {
+            throw "Tauri did not produce an MSI or EXE installer"
+          }
+
+          foreach ($bundle in $bundles) {
+            $bundleType = $bundle.Directory.Name.ToLowerInvariant()
+            $destination = Join-Path $releaseDirectory "UAV-Test-Station-$releaseNumber-$bundleType$($bundle.Extension)"
+            Copy-Item $bundle.FullName $destination
+          }
+
+          "number=$releaseNumber" >> $env:GITHUB_OUTPUT
+          "tag=windows-$releaseNumber" >> $env:GITHUB_OUTPUT
+
+      - name: Upload numbered build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ steps.release.outputs.number }}
+          path: release/windows/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Create permanent GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.release.outputs.tag }}" release/windows/* `
+            --title "UAV Test Station ${{ steps.release.outputs.number }}" `
+            --notes "Automatic Windows x64 build from commit ${{ github.sha }}." `
+            --target "${{ github.sha }}" `
+            --prerelease
