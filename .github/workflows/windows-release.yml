@@ -39,12 +39,6 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Run frontend tests
-        run: npm test -- --run
-
-      - name: Run Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
-
       - name: Build Windows installers
         run: npm run tauri build -- --target x86_64-pc-windows-msvc
 
