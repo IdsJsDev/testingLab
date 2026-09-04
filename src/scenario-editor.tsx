@@ -1315,13 +1315,17 @@ export function ScenarioEditor({ context }: Props) {
             const fcaSamples: number[] = [];
             let nextCurrentLogAt = startedAt;
             let bestRc: number | undefined;
+            let lastReportedRc: number | undefined;
             let maxServo1: number | undefined;
             while (Date.now() < deadline) {
               await new Promise((resolve) => window.setTimeout(resolve, 50));
               const rc = latestContext.current.rcChannels?.[command.throttleChannel - 1];
+              lastReportedRc = rc;
               const servo1 = latestContext.current.servo1OutputPwm;
               if (
                 rc !== undefined &&
+                rc >= 800 &&
+                rc <= 2200 &&
                 (bestRc === undefined ||
                   Math.abs(rc - command.inputPwm) < Math.abs(bestRc - command.inputPwm))
               )
@@ -1352,7 +1356,7 @@ export function ScenarioEditor({ context }: Props) {
               if (cancelled.current)
                 throw new Error(`${stopReason.current}. Все токи: ${currentHistory.join("; ")}`);
             }
-            if (bestRc === undefined || Math.abs(bestRc - command.inputPwm) > 25)
+            if (bestRc !== undefined && Math.abs(bestRc - command.inputPwm) > 25)
               throw new Error(`На ${throttle}% RC override не подтверждён: RC=${bestRc ?? "—"}`);
             if (maxServo1 === undefined || maxServo1 < command.expectedServo1Pwm - 40)
               throw new Error(`На ${throttle}% SERVO1 не достиг команды: ${maxServo1 ?? "—"} мкс`);
@@ -1370,7 +1374,11 @@ export function ScenarioEditor({ context }: Props) {
             measuredPoints.push({ throttle, current: caAverage });
             const spikeWarning =
               caPeak >= block.emergencyCurrentA ? `, одиночный пик CA ${caPeak.toFixed(2)} A` : "";
-            const attempt = `${throttle}%: RC${command.throttleChannel}=${bestRc}, SERVO1=${maxServo1}, FCA=${fcaAverage?.toFixed(2) ?? "—"} A (пик ${fcaPeak?.toFixed(2) ?? "—"}), CA=${caAverage.toFixed(2)} A (пик ${caPeak.toFixed(2)})${spikeWarning}`;
+            const rcReport =
+              bestRc !== undefined
+                ? `${bestRc}`
+                : `нет телеметрии (последнее ${lastReportedRc ?? "—"})`;
+            const attempt = `${throttle}%: RC${command.throttleChannel}=${rcReport}, SERVO1=${maxServo1}, FCA=${fcaAverage?.toFixed(2) ?? "—"} A (пик ${fcaPeak?.toFixed(2) ?? "—"}), CA=${caAverage.toFixed(2)} A (пик ${caPeak.toFixed(2)})${spikeWarning}`;
             attemptLogs.push(attempt);
             updateEntry(block.id, { message: attemptLogs.join(" | ") });
             if (
