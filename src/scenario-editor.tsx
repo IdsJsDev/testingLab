@@ -243,7 +243,11 @@ const motorTestTemplates: SavedScenario[] = [
         emergencyCurrentA: 35,
       },
       { id: "find-load-5", type: "disarmController" },
-      { id: "find-load-6", type: "resultMessage", message: "Нагрузка 20 А найдена, FCA откалиброван по CA" },
+      {
+        id: "find-load-6",
+        type: "resultMessage",
+        message: "Нагрузка 20 А найдена, FCA откалиброван по CA",
+      },
     ],
   },
   motorTestTemplate,
@@ -266,9 +270,7 @@ function loadScenarios(): SavedScenario[] {
           )
           .map((template) => [template.id, template]),
       );
-      const migrated = scenarios.map(
-        (scenario) => updatedBuiltIns.get(scenario.id) ?? scenario,
-      );
+      const migrated = scenarios.map((scenario) => updatedBuiltIns.get(scenario.id) ?? scenario);
       const existingIds = new Set(migrated.map((item) => item.id));
       return [...motorTestTemplates.filter((item) => !existingIds.has(item.id)), ...migrated];
     }
@@ -472,9 +474,7 @@ function Fields({
           <select
             disabled={disabled}
             value={block.durationSeconds}
-            onChange={(e) =>
-              replace({ ...block, durationSeconds: Number(e.currentTarget.value) })
-            }
+            onChange={(e) => replace({ ...block, durationSeconds: Number(e.currentTarget.value) })}
           >
             {Array.from({ length: 10 }, (_, index) => (index + 1) / 2).map((seconds) => (
               <option value={seconds}>{seconds.toLocaleString("ru-RU")}</option>
@@ -684,30 +684,116 @@ function Fields({
   if (block.type === "findCurrentLoad")
     return (
       <div class="block-fields three-fields">
-        <label>Цель, A<input disabled={disabled} type="number" min="1" value={block.targetCurrentA} onInput={(e) => replace({ ...block, targetCurrentA: e.currentTarget.valueAsNumber })} /></label>
-        <label>Допуск, A<input disabled={disabled} type="number" min="0" step="0.1" value={block.toleranceA} onInput={(e) => replace({ ...block, toleranceA: e.currentTarget.valueAsNumber })} /></label>
-        <label>Начальный газ, % диапазона RC<input disabled={disabled} type="number" min="1" max="69" value={block.startThrottlePercent} onInput={(e) => replace({ ...block, startThrottlePercent: e.currentTarget.valueAsNumber })} /></label>
-        <label>Шаг газа, %<input disabled={disabled} type="number" min="1" max="10" value={block.throttleStepPercent} onInput={(e) => replace({ ...block, throttleStepPercent: e.currentTarget.valueAsNumber })} /></label>
-        <label>Максимальный газ, % диапазона RC<input disabled={disabled} type="number" min="2" max="70" value={block.maximumThrottlePercent} onInput={(e) => replace({ ...block, maximumThrottlePercent: e.currentTarget.valueAsNumber })} /></label>
+        <label>
+          Цель, A
+          <input
+            disabled={disabled}
+            type="number"
+            min="1"
+            value={block.targetCurrentA}
+            onInput={(e) => replace({ ...block, targetCurrentA: e.currentTarget.valueAsNumber })}
+          />
+        </label>
+        <label>
+          Допуск, A
+          <input
+            disabled={disabled}
+            type="number"
+            min="0"
+            step="0.1"
+            value={block.toleranceA}
+            onInput={(e) => replace({ ...block, toleranceA: e.currentTarget.valueAsNumber })}
+          />
+        </label>
+        <label>
+          Начальный газ, % диапазона RC
+          <input
+            disabled={disabled}
+            type="number"
+            min="1"
+            max="69"
+            value={block.startThrottlePercent}
+            onInput={(e) =>
+              replace({ ...block, startThrottlePercent: e.currentTarget.valueAsNumber })
+            }
+          />
+        </label>
+        <label>
+          Шаг газа, %
+          <input
+            disabled={disabled}
+            type="number"
+            min="1"
+            max="10"
+            value={block.throttleStepPercent}
+            onInput={(e) =>
+              replace({ ...block, throttleStepPercent: e.currentTarget.valueAsNumber })
+            }
+          />
+        </label>
+        <label>
+          Максимальный газ, % диапазона RC
+          <input
+            disabled={disabled}
+            type="number"
+            min="2"
+            max="70"
+            value={block.maximumThrottlePercent}
+            onInput={(e) =>
+              replace({ ...block, maximumThrottlePercent: e.currentTarget.valueAsNumber })
+            }
+          />
+        </label>
         <label>
           Импульс, с
-          <select disabled={disabled} value={block.pulseDurationSeconds} onChange={(e) => replace({ ...block, pulseDurationSeconds: Number(e.currentTarget.value) })}>
-            {Array.from({ length: 10 }, (_, index) => (index + 1) / 2).map((seconds) => <option value={seconds}>{seconds.toLocaleString("ru-RU")}</option>)}
+          <select
+            disabled={disabled}
+            value={block.pulseDurationSeconds}
+            onChange={(e) =>
+              replace({ ...block, pulseDurationSeconds: Number(e.currentTarget.value) })
+            }
+          >
+            {Array.from({ length: 10 }, (_, index) => (index + 1) / 2).map((seconds) => (
+              <option value={seconds}>{seconds.toLocaleString("ru-RU")}</option>
+            ))}
           </select>
         </label>
         <label>
           Удержание цели, с
-          <select disabled={disabled} value={block.holdDurationSeconds} onChange={(e) => replace({ ...block, holdDurationSeconds: Number(e.currentTarget.value) })}>
-            {Array.from({ length: 10 }, (_, index) => (index + 1) / 2).map((seconds) => <option value={seconds}>{seconds.toLocaleString("ru-RU")}</option>)}
+          <select
+            disabled={disabled}
+            value={block.holdDurationSeconds}
+            onChange={(e) =>
+              replace({ ...block, holdDurationSeconds: Number(e.currentTarget.value) })
+            }
+          >
+            {Array.from({ length: 10 }, (_, index) => (index + 1) / 2).map((seconds) => (
+              <option value={seconds}>{seconds.toLocaleString("ru-RU")}</option>
+            ))}
           </select>
         </label>
         <label>
           Пауза, с
-          <select disabled={disabled} value={block.cooldownSeconds} onChange={(e) => replace({ ...block, cooldownSeconds: Number(e.currentTarget.value) })}>
-            {Array.from({ length: 10 }, (_, index) => (index + 1) / 2).map((seconds) => <option value={seconds}>{seconds.toLocaleString("ru-RU")}</option>)}
+          <select
+            disabled={disabled}
+            value={block.cooldownSeconds}
+            onChange={(e) => replace({ ...block, cooldownSeconds: Number(e.currentTarget.value) })}
+          >
+            {Array.from({ length: 10 }, (_, index) => (index + 1) / 2).map((seconds) => (
+              <option value={seconds}>{seconds.toLocaleString("ru-RU")}</option>
+            ))}
           </select>
         </label>
-        <label>Аварийный ток, A<input disabled={disabled} type="number" min="1" value={block.emergencyCurrentA} onInput={(e) => replace({ ...block, emergencyCurrentA: e.currentTarget.valueAsNumber })} /></label>
+        <label>
+          Аварийный ток, A
+          <input
+            disabled={disabled}
+            type="number"
+            min="1"
+            value={block.emergencyCurrentA}
+            onInput={(e) => replace({ ...block, emergencyCurrentA: e.currentTarget.valueAsNumber })}
+          />
+        </label>
       </div>
     );
   return null;
@@ -975,6 +1061,7 @@ export function ScenarioEditor({ context }: Props) {
     stopReason.current = "Остановлено оператором";
     setEntries([]);
     setStatus("running");
+    const controllerIsArmed = () => latestContext.current.armed === true;
     let integratedCalibrationMessage: string | null = null;
     for (const [blockIndex, block] of blocks.entries()) {
       if (cancelled.current) {
@@ -1029,11 +1116,11 @@ export function ScenarioEditor({ context }: Props) {
             const previousStatusText = latestContext.current.controllerStatusText;
             await invoke("set_flight_controller_armed", { armed: true, force: block.force });
             const deadline = Date.now() + 5000;
-            while (!Boolean(latestContext.current.armed) && Date.now() < deadline) {
+            while (!controllerIsArmed() && Date.now() < deadline) {
               await new Promise((resolve) => window.setTimeout(resolve, 100));
               if (cancelled.current) throw new Error(stopReason.current);
             }
-            if (!Boolean(latestContext.current.armed)) {
+            if (!controllerIsArmed()) {
               const statusText = latestContext.current.controllerStatusText;
               throw new Error(
                 statusText && statusText !== previousStatusText
@@ -1140,9 +1227,7 @@ export function ScenarioEditor({ context }: Props) {
           const averageCurrentA = currentSamplesA.length
             ? currentSamplesA.reduce((sum, value) => sum + value, 0) / currentSamplesA.length
             : undefined;
-          const peakCurrentA = currentSamplesA.length
-            ? Math.max(...currentSamplesA)
-            : undefined;
+          const peakCurrentA = currentSamplesA.length ? Math.max(...currentSamplesA) : undefined;
           const averageControllerCurrentA = controllerCurrentSamplesA.length
             ? controllerCurrentSamplesA.reduce((sum, value) => sum + value, 0) /
               controllerCurrentSamplesA.length
@@ -1206,11 +1291,11 @@ export function ScenarioEditor({ context }: Props) {
             if (latestContext.current.armed !== true) {
               await invoke("set_flight_controller_armed", { armed: true, force: true });
               const armDeadline = Date.now() + 5000;
-              while (!Boolean(latestContext.current.armed) && Date.now() < armDeadline) {
+              while (!controllerIsArmed() && Date.now() < armDeadline) {
                 await new Promise((resolve) => window.setTimeout(resolve, 100));
                 if (cancelled.current) throw new Error(stopReason.current);
               }
-              if (!Boolean(latestContext.current.armed))
+              if (!controllerIsArmed())
                 throw new Error(`ARM не подтверждён перед ступенью ${throttle}%`);
             }
 
@@ -1243,8 +1328,7 @@ export function ScenarioEditor({ context }: Props) {
                 bestRc = rc;
               if (servo1 !== undefined && (maxServo1 === undefined || servo1 > maxServo1))
                 maxServo1 = servo1;
-              const underLoad =
-                servo1 !== undefined && servo1 >= command.expectedServo1Pwm - 40;
+              const underLoad = servo1 !== undefined && servo1 >= command.expectedServo1Pwm - 40;
               const elapsedLoadMs = Date.now() - startedAt;
               if (
                 underLoad &&
@@ -1285,9 +1369,7 @@ export function ScenarioEditor({ context }: Props) {
             lastThrottle = throttle;
             measuredPoints.push({ throttle, current: caAverage });
             const spikeWarning =
-              caPeak >= block.emergencyCurrentA
-                ? `, одиночный пик CA ${caPeak.toFixed(2)} A`
-                : "";
+              caPeak >= block.emergencyCurrentA ? `, одиночный пик CA ${caPeak.toFixed(2)} A` : "";
             const attempt = `${throttle}%: RC${command.throttleChannel}=${bestRc}, SERVO1=${maxServo1}, FCA=${fcaAverage?.toFixed(2) ?? "—"} A (пик ${fcaPeak?.toFixed(2) ?? "—"}), CA=${caAverage.toFixed(2)} A (пик ${caPeak.toFixed(2)})${spikeWarning}`;
             attemptLogs.push(attempt);
             updateEntry(block.id, { message: attemptLogs.join(" | ") });
@@ -1430,7 +1512,9 @@ export function ScenarioEditor({ context }: Props) {
           const holdFcaAverage = holdFca.length ? holdAverage(holdFca) : undefined;
           const holdFcaPeak = holdFca.length ? Math.max(...holdFca) : undefined;
           if (Math.abs(holdCaAverage - block.targetCurrentA) > block.toleranceA)
-            throw new Error(`При удержании CA вышел из диапазона: средний ${holdCaAverage.toFixed(2)} A. ${holdHistory.join("; ")}`);
+            throw new Error(
+              `При удержании CA вышел из диапазона: средний ${holdCaAverage.toFixed(2)} A. ${holdHistory.join("; ")}`,
+            );
           const holdSpikeWarning =
             holdCaPeak >= block.emergencyCurrentA
               ? ` Одиночный пик CA ${holdCaPeak.toFixed(2)} A отмечен как предупреждение.`
@@ -1439,9 +1523,12 @@ export function ScenarioEditor({ context }: Props) {
             throw new Error("Нет данных FCA во время удержания цели");
           if (calibrationBlock) {
             const parameterName = calibrationBlock.parameterName.trim().toUpperCase();
-            const originalParameter = await invoke<FreshParameter>("read_flight_controller_parameter", {
-              name: parameterName,
-            });
+            const originalParameter = await invoke<FreshParameter>(
+              "read_flight_controller_parameter",
+              {
+                name: parameterName,
+              },
+            );
             let currentParameterValue = originalParameter.value;
             let measuredCa = holdCaAverage;
             let measuredFca = holdFcaAverage;
@@ -1451,12 +1538,16 @@ export function ScenarioEditor({ context }: Props) {
               const beforeDifference = Math.abs(measuredFca - measuredCa);
               if (beforeDifference <= calibrationBlock.comparisonToleranceA) {
                 calibrated = true;
-                calibrationLogs.push(`попытка ${attempt}: коррекция не нужна, разница ${beforeDifference.toFixed(2)} A`);
+                calibrationLogs.push(
+                  `попытка ${attempt}: коррекция не нужна, разница ${beforeDifference.toFixed(2)} A`,
+                );
                 break;
               }
               const ratio = measuredCa / measuredFca;
               if (!Number.isFinite(ratio) || ratio < 0.5 || ratio > 2)
-                throw new Error(`Небезопасный коэффициент коррекции ${ratio.toFixed(3)}; параметр не изменён`);
+                throw new Error(
+                  `Небезопасный коэффициент коррекции ${ratio.toFixed(3)}; параметр не изменён`,
+                );
               const requestedValue = currentParameterValue * ratio;
               await invoke<MotorRotationCommand>("start_motor_rotation", {
                 throttlePercent: holdThrottle,
@@ -1469,15 +1560,21 @@ export function ScenarioEditor({ context }: Props) {
               const confirmed = await invoke<FreshParameter>("read_flight_controller_parameter", {
                 name: parameterName,
               });
-              if (Math.abs(confirmed.value - requestedValue) > Math.max(0.01, Math.abs(requestedValue) * 0.005))
-                throw new Error(`Запись ${parameterName} не подтверждена: ожидалось ${requestedValue.toFixed(4)}, получено ${confirmed.value.toFixed(4)}`);
+              if (
+                Math.abs(confirmed.value - requestedValue) >
+                Math.max(0.01, Math.abs(requestedValue) * 0.005)
+              )
+                throw new Error(
+                  `Запись ${parameterName} не подтверждена: ожидалось ${requestedValue.toFixed(4)}, получено ${confirmed.value.toFixed(4)}`,
+                );
               currentParameterValue = confirmed.value;
               await invoke<MotorRotationCommand>("start_motor_rotation", {
                 throttlePercent: holdThrottle,
                 durationSeconds: Math.min(5, calibrationBlock.maximumDurationSeconds + 1),
               });
               const verifyStartedAt = Date.now();
-              const verifyDeadline = verifyStartedAt + calibrationBlock.maximumDurationSeconds * 1000;
+              const verifyDeadline =
+                verifyStartedAt + calibrationBlock.maximumDurationSeconds * 1000;
               const verifyCa: number[] = [];
               const verifyFca: number[] = [];
               while (Date.now() < verifyDeadline) {
@@ -1498,7 +1595,9 @@ export function ScenarioEditor({ context }: Props) {
               measuredCa = holdAverage(verifyCa);
               measuredFca = holdAverage(verifyFca);
               const difference = Math.abs(measuredFca - measuredCa);
-              calibrationLogs.push(`попытка ${attempt}: ${parameterName}=${currentParameterValue.toFixed(4)}, FCA=${measuredFca.toFixed(2)} A, CA=${measuredCa.toFixed(2)} A, разница ${difference.toFixed(2)} A`);
+              calibrationLogs.push(
+                `попытка ${attempt}: ${parameterName}=${currentParameterValue.toFixed(4)}, FCA=${measuredFca.toFixed(2)} A, CA=${measuredCa.toFixed(2)} A, разница ${difference.toFixed(2)} A`,
+              );
               if (difference <= calibrationBlock.comparisonToleranceA) {
                 calibrated = true;
                 break;
@@ -1508,7 +1607,9 @@ export function ScenarioEditor({ context }: Props) {
               await invoke("write_flight_controller_parameters", {
                 requests: [{ name: parameterName, value: originalParameter.value }],
               });
-              throw new Error(`Калибровка не достигла допуска ±${calibrationBlock.comparisonToleranceA} A за 3 попытки. Старое значение ${originalParameter.value.toFixed(4)} отправлено на восстановление. ${calibrationLogs.join(" | ")}`);
+              throw new Error(
+                `Калибровка не достигла допуска ±${calibrationBlock.comparisonToleranceA} A за 3 попытки. Старое значение ${originalParameter.value.toFixed(4)} отправлено на восстановление. ${calibrationLogs.join(" | ")}`,
+              );
             }
             integratedCalibrationMessage = `${parameterName}: ${originalParameter.value.toFixed(4)} → ${currentParameterValue.toFixed(4)}; газ непрерывно удерживался на ${holdThrottle}%. ${calibrationLogs.join(" | ")}`;
           }
@@ -1521,10 +1622,7 @@ export function ScenarioEditor({ context }: Props) {
             throw new Error("Блок калибровки должен находиться сразу после поиска нагрузки");
           message = integratedCalibrationMessage;
           integratedCalibrationMessage = null;
-        } else if (
-          block.type === "measureMaximumCurrent" ||
-          block.type === "tuneRcMaxByCurrent"
-        ) {
+        } else if (block.type === "measureMaximumCurrent" || block.type === "tuneRcMaxByCurrent") {
           throw new Error(
             "Моторный backend ещё не активирован: управляющая команда не отправлялась",
           );
@@ -1739,13 +1837,16 @@ export function ScenarioEditor({ context }: Props) {
             <p class="eyebrow">Проверка оператором</p>
             <h2>{rotationPrompt.question}</h2>
             <p>
-              Газ {rotationPrompt.throttlePercent}% · RC{rotationPrompt.rcChannel}={rotationPrompt.inputPwm} мкс · SERVO1={rotationPrompt.servo1Pwm} мкс
+              Газ {rotationPrompt.throttlePercent}% · RC{rotationPrompt.rcChannel}=
+              {rotationPrompt.inputPwm} мкс · SERVO1={rotationPrompt.servo1Pwm} мкс
             </p>
             <p>
-              FCA: средний {rotationPrompt.averageControllerCurrentA?.toFixed(2) ?? "нет данных"} A · пик {rotationPrompt.peakControllerCurrentA?.toFixed(2) ?? "нет данных"} A
+              FCA: средний {rotationPrompt.averageControllerCurrentA?.toFixed(2) ?? "нет данных"} A
+              · пик {rotationPrompt.peakControllerCurrentA?.toFixed(2) ?? "нет данных"} A
             </p>
             <p>
-              CA: средний {rotationPrompt.averageCurrentA?.toFixed(2) ?? "нет данных"} A · пик {rotationPrompt.peakCurrentA?.toFixed(2) ?? "нет данных"} A
+              CA: средний {rotationPrompt.averageCurrentA?.toFixed(2) ?? "нет данных"} A · пик{" "}
+              {rotationPrompt.peakCurrentA?.toFixed(2) ?? "нет данных"} A
             </p>
             <div class="rotation-prompt-actions">
               <button

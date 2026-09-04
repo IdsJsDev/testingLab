@@ -315,8 +315,7 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
       if (
         block.pulseDurationSeconds < 0.5 ||
         block.pulseDurationSeconds > 5 ||
-        Math.abs(block.pulseDurationSeconds * 2 - Math.round(block.pulseDurationSeconds * 2)) >
-          1e-6
+        Math.abs(block.pulseDurationSeconds * 2 - Math.round(block.pulseDurationSeconds * 2)) > 1e-6
       )
         errors.push(`${prefix}: импульс должен быть от 0,5 до 5 секунд с шагом 0,5`);
       if (
@@ -329,8 +328,7 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
         !Number.isFinite(block.holdDurationSeconds) ||
         block.holdDurationSeconds < 0.5 ||
         block.holdDurationSeconds > 5 ||
-        Math.abs(block.holdDurationSeconds * 2 - Math.round(block.holdDurationSeconds * 2)) >
-          1e-6
+        Math.abs(block.holdDurationSeconds * 2 - Math.round(block.holdDurationSeconds * 2)) > 1e-6
       )
         errors.push(`${prefix}: удержание должно быть от 0,5 до 5 секунд с шагом 0,5`);
       if (block.emergencyCurrentA <= block.targetCurrentA + block.toleranceA)
