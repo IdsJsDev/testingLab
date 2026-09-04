@@ -6,5 +6,8 @@ Each workflow run uses a unique versioned name such as:
 
 `UAV-Test-Station-v0.1.0-build.12-msi.msi`
 
+The `portable.exe` build runs directly without installation. Release builds use
+the Windows GUI subsystem, so they do not open an additional console window.
+
 Installers are uploaded to a permanent GitHub Release and also retained as a
 GitHub Actions artifact. Generated binary files are not committed to Git.

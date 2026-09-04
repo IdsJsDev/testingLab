@@ -42,7 +42,7 @@ jobs:
       - name: Build Windows installers
         run: npm run tauri build -- --target x86_64-pc-windows-msvc
 
-      - name: Number and collect installers
+      - name: Number and collect Windows builds
         id: release
         shell: pwsh
         run: |
@@ -58,11 +58,18 @@ jobs:
             throw "Tauri did not produce an MSI or EXE installer"
           }
 
+          $portableExecutable = "src-tauri/target/x86_64-pc-windows-msvc/release/uav-test-station.exe"
+          if (-not (Test-Path $portableExecutable)) {
+            throw "Tauri did not produce the portable application executable"
+          }
+
           foreach ($bundle in $bundles) {
             $bundleType = $bundle.Directory.Name.ToLowerInvariant()
             $destination = Join-Path $releaseDirectory "UAV-Test-Station-$releaseNumber-$bundleType$($bundle.Extension)"
             Copy-Item $bundle.FullName $destination
           }
+
+          Copy-Item $portableExecutable (Join-Path $releaseDirectory "UAV-Test-Station-$releaseNumber-portable.exe")
 
           "number=$releaseNumber" >> $env:GITHUB_OUTPUT
           "tag=windows-$releaseNumber" >> $env:GITHUB_OUTPUT
