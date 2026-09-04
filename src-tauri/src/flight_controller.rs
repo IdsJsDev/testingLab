@@ -133,6 +133,21 @@ pub struct TelemetrySnapshot {
     pub battery_voltage_v: Option<f32>,
     pub battery_current_a: Option<f32>,
     pub battery_remaining_percent: Option<i8>,
+    pub airspeed_mps: Option<f32>,
+    pub barometer_pressure_hpa: Option<f32>,
+    pub barometer_temperature_c: Option<f32>,
+    pub accelerometer_x_mg: Option<i16>,
+    pub accelerometer_y_mg: Option<i16>,
+    pub accelerometer_z_mg: Option<i16>,
+    pub compass_x_mgauss: Option<i16>,
+    pub compass_y_mgauss: Option<i16>,
+    pub compass_z_mgauss: Option<i16>,
+    pub compass_heading_deg: Option<i16>,
+    pub battery_update_count: u64,
+    pub airspeed_update_count: u64,
+    pub barometer_update_count: u64,
+    pub imu_update_count: u64,
+    pub rc_update_count: u64,
     pub roll_rad: Option<f32>,
     pub pitch_rad: Option<f32>,
     pub yaw_rad: Option<f32>,
@@ -1122,13 +1137,16 @@ fn request_telemetry_messages(
     sequence: &mut u8,
     port_name: &str,
 ) -> bool {
-    // SYS_STATUS, GPS_RAW_INT, ATTITUDE, SERVO_OUTPUT_RAW, RC_CHANNELS and BATTERY_STATUS.
+    // Core state plus scaled IMU, barometer and airspeed/heading readings.
     let requests = [
         (1_u32, 500_000_u32),
         (24, 500_000),
+        (26, 100_000),
+        (29, 200_000),
         (30, 200_000),
         (36, 100_000),
         (65, 200_000),
+        (74, 200_000),
         (147, 500_000),
     ];
 
@@ -1252,6 +1270,7 @@ fn update_telemetry(snapshot: &mut TelemetrySnapshot, message: &MavMessage) {
             snapshot.system_status = Some(format!("{:?}", data.system_status));
         }
         MavMessage::SYS_STATUS(data) => {
+            snapshot.battery_update_count += 1;
             snapshot.cpu_load_percent = Some(f32::from(data.load) / 10.0);
             snapshot.battery_voltage_v = (data.voltage_battery != u16::MAX)
                 .then(|| f32::from(data.voltage_battery) / 1000.0);
@@ -1261,6 +1280,17 @@ fn update_telemetry(snapshot: &mut TelemetrySnapshot, message: &MavMessage) {
                 (data.battery_remaining >= 0).then_some(data.battery_remaining);
         }
         MavMessage::BATTERY_STATUS(data) => {
+            snapshot.battery_update_count += 1;
+            let voltage_mv: u32 = data
+                .voltages
+                .iter()
+                .copied()
+                .filter(|voltage| *voltage != u16::MAX)
+                .map(u32::from)
+                .sum();
+            if voltage_mv > 0 {
+                snapshot.battery_voltage_v = Some(voltage_mv as f32 / 1000.0);
+            }
             snapshot.battery_current_a =
                 (data.current_battery >= 0).then(|| f32::from(data.current_battery) / 100.0);
             snapshot.battery_remaining_percent =
@@ -1270,6 +1300,27 @@ fn update_telemetry(snapshot: &mut TelemetrySnapshot, message: &MavMessage) {
             snapshot.roll_rad = Some(data.roll);
             snapshot.pitch_rad = Some(data.pitch);
             snapshot.yaw_rad = Some(data.yaw);
+        }
+        MavMessage::SCALED_IMU(data) => {
+            snapshot.imu_update_count += 1;
+            snapshot.accelerometer_x_mg = Some(data.xacc);
+            snapshot.accelerometer_y_mg = Some(data.yacc);
+            snapshot.accelerometer_z_mg = Some(data.zacc);
+            snapshot.compass_x_mgauss = Some(data.xmag);
+            snapshot.compass_y_mgauss = Some(data.ymag);
+            snapshot.compass_z_mgauss = Some(data.zmag);
+        }
+        MavMessage::SCALED_PRESSURE(data) => {
+            snapshot.barometer_update_count += 1;
+            snapshot.barometer_pressure_hpa = data.press_abs.is_finite().then_some(data.press_abs);
+            snapshot.barometer_temperature_c =
+                (data.temperature != i16::MAX).then(|| f32::from(data.temperature) / 100.0);
+        }
+        MavMessage::VFR_HUD(data) => {
+            snapshot.airspeed_update_count += 1;
+            snapshot.airspeed_mps = data.airspeed.is_finite().then_some(data.airspeed);
+            snapshot.compass_heading_deg =
+                (0..=360).contains(&data.heading).then_some(data.heading);
         }
         MavMessage::SERVO_OUTPUT_RAW(data) => {
             snapshot.servo1_output_pwm = Some(data.servo1_raw);
@@ -1286,6 +1337,7 @@ fn update_telemetry(snapshot: &mut TelemetrySnapshot, message: &MavMessage) {
             }
         }
         MavMessage::RC_CHANNELS(data) => {
+            snapshot.rc_update_count += 1;
             snapshot.rc_channels = Some([
                 data.chan1_raw,
                 data.chan2_raw,

@@ -1231,6 +1231,12 @@ h1 {
   color: #efa08f;
   background: #281713;
 }
+.run-summary.warning {
+  color: #ffb3a4;
+  background: #3a1712;
+  font-size: 18px;
+  font-weight: 800;
+}
 .run-summary.running {
   color: #e9ca80;
   background: #27220f;
@@ -1254,10 +1260,28 @@ h1 {
 .run-entry.failed > span {
   color: #e27d68;
 }
+.run-entry.warning {
+  border: 2px solid #e34f38;
+  border-radius: 8px;
+  padding: 14px;
+  background: #351410;
+}
+.run-entry.warning > span,
+.run-warning-banner {
+  color: #ff7d67;
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.4;
+}
+.run-warning-banner {
+  margin-top: 8px;
+  white-space: pre-line;
+}
 .run-entry p {
   margin-top: 3px;
   color: #82938f;
   font-size: 12px;
+  white-space: pre-line;
 }
 
 .mcp-list > div,

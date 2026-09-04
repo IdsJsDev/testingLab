@@ -48,6 +48,21 @@ type TelemetrySnapshot = {
   batteryVoltageV?: number;
   batteryCurrentA?: number;
   batteryRemainingPercent?: number;
+  airspeedMps?: number;
+  barometerPressureHpa?: number;
+  barometerTemperatureC?: number;
+  accelerometerXMg?: number;
+  accelerometerYMg?: number;
+  accelerometerZMg?: number;
+  compassXMgauss?: number;
+  compassYMgauss?: number;
+  compassZMgauss?: number;
+  compassHeadingDeg?: number;
+  batteryUpdateCount: number;
+  airspeedUpdateCount: number;
+  barometerUpdateCount: number;
+  imuUpdateCount: number;
+  rcUpdateCount: number;
   rollRad?: number;
   pitchRad?: number;
   yawRad?: number;
@@ -770,7 +785,6 @@ export function App() {
               </p>
             </section>
             <section class="telemetry-grid">
-              <Metric label="Состояние" value={telemetry?.systemStatus ?? heartbeat.systemStatus} />
               <Metric
                 label="Arm"
                 value={
@@ -783,18 +797,28 @@ export function App() {
               />
               <Metric label="Загрузка CPU" value={telemetry?.cpuLoadPercent?.toFixed(1)} unit="%" />
               <Metric label="Сообщений принято" value={telemetry?.messageCount} />
-              <Metric label="Напряжение" value={telemetry?.batteryVoltageV?.toFixed(2)} unit="V" />
               <Metric
-                label="Ток контроллера"
-                value={telemetry?.batteryCurrentA?.toFixed(2)}
-                unit="A"
+                label="Напряжение батареи"
+                value={telemetry?.batteryVoltageV?.toFixed(2)}
+                unit="V"
               />
+              <Metric label="Текущий ток" value={telemetry?.batteryCurrentA?.toFixed(2)} unit="A" />
               <Metric label="Заряд" value={telemetry?.batteryRemainingPercent} unit="%" />
-              <Metric label="GPS fix" value={telemetry?.gpsFix} />
-              <Metric label="Спутники" value={telemetry?.satellitesVisible} />
-              <Metric label="Roll" value={telemetry?.rollRad?.toFixed(3)} unit="rad" />
-              <Metric label="Pitch" value={telemetry?.pitchRad?.toFixed(3)} unit="rad" />
-              <Metric label="Yaw" value={telemetry?.yawRad?.toFixed(3)} unit="rad" />
+              <Metric label="ASPD" value={telemetry?.airspeedMps?.toFixed(2)} unit="m/s" />
+              <Metric
+                label="Барометр"
+                value={telemetry?.barometerPressureHpa?.toFixed(2)}
+                unit="hPa"
+              />
+              <Metric
+                label="Температура барометра"
+                value={telemetry?.barometerTemperatureC?.toFixed(1)}
+                unit="°C"
+              />
+              <Metric label="Акселерометр X" value={telemetry?.accelerometerXMg} unit="mg" />
+              <Metric label="Акселерометр Y" value={telemetry?.accelerometerYMg} unit="mg" />
+              <Metric label="Акселерометр Z" value={telemetry?.accelerometerZMg} unit="mg" />
+              <Metric label="Курс компаса" value={telemetry?.compassHeadingDeg} unit="°" />
               {ammeter && (
                 <Metric label="Эталонный ток" value={ammeter.currentAmps.toFixed(3)} unit="A" />
               )}
@@ -1241,8 +1265,34 @@ export function App() {
               rcChannels: telemetry?.rcChannels,
               servo1OutputPwm: telemetry?.servo1OutputPwm,
               controllerCurrentA: telemetry?.batteryCurrentA,
+              telemetry: telemetry
+                ? {
+                    batteryVoltageV: telemetry.batteryVoltageV,
+                    batteryCurrentA: telemetry.batteryCurrentA,
+                    batteryRemainingPercent: telemetry.batteryRemainingPercent,
+                    cpuLoadPercent: telemetry.cpuLoadPercent,
+                    messageCount: telemetry.messageCount,
+                    armed: telemetry.armed,
+                    airspeedMps: telemetry.airspeedMps,
+                    barometerPressureHpa: telemetry.barometerPressureHpa,
+                    barometerTemperatureC: telemetry.barometerTemperatureC,
+                    accelerometerXMg: telemetry.accelerometerXMg,
+                    accelerometerYMg: telemetry.accelerometerYMg,
+                    accelerometerZMg: telemetry.accelerometerZMg,
+                    compassHeadingDeg: telemetry.compassHeadingDeg,
+                    rcChannels: telemetry.rcChannels,
+                    rcChannelCount: telemetry.rcChannelCount,
+                    batteryUpdateCount: telemetry.batteryUpdateCount,
+                    airspeedUpdateCount: telemetry.airspeedUpdateCount,
+                    barometerUpdateCount: telemetry.barometerUpdateCount,
+                    imuUpdateCount: telemetry.imuUpdateCount,
+                    rcUpdateCount: telemetry.rcUpdateCount,
+                  }
+                : undefined,
               ammeterConnected: ammeter !== null,
               ammeterCurrentA: ammeter?.currentAmps,
+              ammeterSensorVoltage: ammeter?.sensorVoltage,
+              ammeterMessageCount: ammeter?.messageCount,
               parameters: parameters?.items ?? [],
             }}
           />

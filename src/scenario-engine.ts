@@ -6,8 +6,32 @@ export type ScenarioContext = {
   rcChannels?: number[];
   servo1OutputPwm?: number;
   controllerCurrentA?: number;
+  telemetry?: {
+    batteryVoltageV?: number;
+    batteryCurrentA?: number;
+    batteryRemainingPercent?: number;
+    cpuLoadPercent?: number;
+    messageCount: number;
+    armed?: boolean;
+    airspeedMps?: number;
+    barometerPressureHpa?: number;
+    barometerTemperatureC?: number;
+    accelerometerXMg?: number;
+    accelerometerYMg?: number;
+    accelerometerZMg?: number;
+    compassHeadingDeg?: number;
+    rcChannels?: number[];
+    rcChannelCount?: number;
+    batteryUpdateCount: number;
+    airspeedUpdateCount: number;
+    barometerUpdateCount: number;
+    imuUpdateCount: number;
+    rcUpdateCount: number;
+  };
   ammeterConnected: boolean;
   ammeterCurrentA?: number;
+  ammeterSensorVoltage?: number;
+  ammeterMessageCount?: number;
   parameters: Array<{ name: string; value: number }>;
 };
 
@@ -17,6 +41,7 @@ export type ScenarioBlock =
   | { id: string; type: "requireDisarmed" }
   | { id: string; type: "parameterEquals"; name: string; expected: number; tolerance: number }
   | { id: string; type: "currentInRange"; minimum: number; maximum: number }
+  | { id: string; type: "checkTelemetryAlive"; seconds: number; minimumChangingGroups: number }
   | { id: string; type: "wait"; seconds: number }
   | {
       id: string;
@@ -117,6 +142,12 @@ export const blockCatalog: BlockDefinition[] = [
       expected: 4,
       tolerance: 0,
     }),
+  },
+  {
+    type: "checkTelemetryAlive",
+    label: "Проверить живую телеметрию",
+    description: "Проверяет наличие, обновление и небольшие изменения основных датчиков.",
+    create: (id) => ({ id, type: "checkTelemetryAlive", seconds: 5, minimumChangingGroups: 2 }),
   },
   {
     type: "currentInRange",
@@ -264,6 +295,15 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
     } else if (block.type === "currentInRange") {
       if (![block.minimum, block.maximum].every(Number.isFinite) || block.minimum > block.maximum)
         errors.push(`${prefix}: некорректный диапазон тока`);
+    } else if (block.type === "checkTelemetryAlive") {
+      if (!Number.isFinite(block.seconds) || block.seconds < 2 || block.seconds > 30)
+        errors.push(`${prefix}: проверка телеметрии должна длиться от 2 до 30 секунд`);
+      if (
+        !Number.isInteger(block.minimumChangingGroups) ||
+        block.minimumChangingGroups < 1 ||
+        block.minimumChangingGroups > 4
+      )
+        errors.push(`${prefix}: число изменяющихся групп должно быть от 1 до 4`);
     } else if (block.type === "wait") {
       if (!Number.isFinite(block.seconds) || block.seconds < 0 || block.seconds > 300)
         errors.push(`${prefix}: ожидание должно быть от 0 до 300 секунд`);

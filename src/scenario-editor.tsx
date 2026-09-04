@@ -15,7 +15,7 @@ import {
 type RunEntry = {
   blockId: string;
   label: string;
-  status: "running" | "passed" | "failed";
+  status: "running" | "passed" | "warning" | "failed";
   message: string;
 };
 type FreshParameter = { name: string; value: number };
@@ -51,7 +51,7 @@ type ScenarioFile = {
 };
 
 const STORAGE_KEY = "uav-test-station.scenarios.v1";
-const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v18";
+const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v19";
 const safetyConfirmation = {
   type: "operatorConfirmation" as const,
   message: "БПЛА закреплён, защитная зона свободна, аварийное отключение готово",
@@ -114,6 +114,21 @@ const motorTestTemplate: SavedScenario = {
 };
 
 const motorTestTemplates: SavedScenario[] = [
+  {
+    id: "built-in-telemetry-check-v1",
+    name: "00 — Проверка основной телеметрии",
+    updatedAt: Date.now(),
+    blocks: [
+      { id: "telemetry-1", type: "requireController" },
+      {
+        id: "telemetry-2",
+        type: "checkTelemetryAlive",
+        seconds: 5,
+        minimumChangingGroups: 2,
+      },
+      { id: "telemetry-3", type: "resultMessage", message: "Основная телеметрия проверена" },
+    ],
+  },
   {
     id: "built-in-motor-rotation-v1",
     name: "01 — Проверка вращения двигателя",
@@ -264,6 +279,7 @@ function loadScenarios(): SavedScenario[] {
           .filter(
             (template) =>
               template.id === "built-in-motor-rotation-v1" ||
+              template.id === "built-in-telemetry-check-v1" ||
               template.id === "built-in-find-current-load-v1" ||
               template.id === "built-in-current-calibration-v1" ||
               template.id === motorTestTemplate.id,
@@ -306,6 +322,37 @@ function Fields({
   replace: (value: ScenarioBlock) => void;
   disabled: boolean;
 }) {
+  if (block.type === "checkTelemetryAlive")
+    return (
+      <div class="block-fields">
+        <label>
+          Время проверки, с
+          <input
+            disabled={disabled}
+            type="number"
+            min="2"
+            max="30"
+            step="1"
+            value={block.seconds}
+            onInput={(e) => replace({ ...block, seconds: e.currentTarget.valueAsNumber })}
+          />
+        </label>
+        <label>
+          Минимум изменяющихся групп
+          <input
+            disabled={disabled}
+            type="number"
+            min="1"
+            max="4"
+            step="1"
+            value={block.minimumChangingGroups}
+            onInput={(e) =>
+              replace({ ...block, minimumChangingGroups: e.currentTarget.valueAsNumber })
+            }
+          />
+        </label>
+      </div>
+    );
   if (block.type === "parameterEquals")
     return (
       <div class="block-fields three-fields">
@@ -811,9 +858,9 @@ export function ScenarioEditor({ context }: Props) {
   const [selectedType, setSelectedType] = useState<BlockType>("requireController");
   const [errors, setErrors] = useState<string[]>([]);
   const [entries, setEntries] = useState<RunEntry[]>([]);
-  const [status, setStatus] = useState<"idle" | "running" | "passed" | "failed" | "cancelled">(
-    "idle",
-  );
+  const [status, setStatus] = useState<
+    "idle" | "running" | "passed" | "warning" | "failed" | "cancelled"
+  >("idle");
   const cancelled = useRef(false);
   const motorActive = useRef(false);
   const activeEmergencyCurrentA = useRef<number | null>(null);
@@ -1063,6 +1110,7 @@ export function ScenarioEditor({ context }: Props) {
     setStatus("running");
     const controllerIsArmed = () => latestContext.current.armed === true;
     let integratedCalibrationMessage: string | null = null;
+    let runHasWarnings = false;
     for (const [blockIndex, block] of blocks.entries()) {
       if (cancelled.current) {
         setStatus("cancelled");
@@ -1074,7 +1122,155 @@ export function ScenarioEditor({ context }: Props) {
       ]);
       try {
         let message: string;
-        if (block.type === "wait") {
+        let entryStatus: RunEntry["status"] = "passed";
+        if (block.type === "checkTelemetryAlive") {
+          if (!latestContext.current.controllerConnected)
+            throw new Error("Полётный контроллер не подключён");
+          const samples: NonNullable<ScenarioContext["telemetry"]>[] = [];
+          const ammeterSamples: Array<{
+            current?: number;
+            voltage?: number;
+            messageCount?: number;
+          }> = [];
+          const deadline = Date.now() + block.seconds * 1000;
+          while (Date.now() < deadline) {
+            const sample = latestContext.current.telemetry;
+            if (sample) samples.push({ ...sample });
+            if (latestContext.current.ammeterConnected)
+              ammeterSamples.push({
+                current: latestContext.current.ammeterCurrentA,
+                voltage: latestContext.current.ammeterSensorVoltage,
+                messageCount: latestContext.current.ammeterMessageCount,
+              });
+            await new Promise((resolve) => window.setTimeout(resolve, 250));
+            if (cancelled.current) throw new Error("Выполнение отменено оператором");
+          }
+          if (samples.length < 2) throw new Error("Не получены снимки основной телеметрии");
+          const first = samples[0];
+          const last = samples[samples.length - 1];
+          const stale = [
+            ["батарея", first.batteryUpdateCount, last.batteryUpdateCount],
+            ["ASPD", first.airspeedUpdateCount, last.airspeedUpdateCount],
+            ["барометр", first.barometerUpdateCount, last.barometerUpdateCount],
+            ["IMU", first.imuUpdateCount, last.imuUpdateCount],
+            ["RC input", first.rcUpdateCount, last.rcUpdateCount],
+          ].filter(([, start, end]) => end === start);
+          if (stale.length)
+            throw new Error(
+              `Не обновляются группы телеметрии: ${stale.map(([label]) => label).join(", ")}`,
+            );
+          const required = [
+            ["напряжение батареи", last.batteryVoltageV],
+            ["текущий ток", last.batteryCurrentA],
+            ["заряд батареи", last.batteryRemainingPercent],
+            ["ASPD", last.airspeedMps],
+            ["барометр", last.barometerPressureHpa],
+            ["температура барометра", last.barometerTemperatureC],
+            ["акселерометр X", last.accelerometerXMg],
+            ["акселерометр Y", last.accelerometerYMg],
+            ["акселерометр Z", last.accelerometerZMg],
+            ["курс компаса", last.compassHeadingDeg],
+          ] as const;
+          const missing = required.filter(
+            ([, value]) => value === undefined || !Number.isFinite(value),
+          );
+          if (missing.length)
+            throw new Error(`Нет корректных данных: ${missing.map(([label]) => label).join(", ")}`);
+          if (last.armed === undefined) throw new Error("Нет данных ARM/DISARM");
+          const rcCount = Math.min(last.rcChannelCount ?? 0, last.rcChannels?.length ?? 0, 18);
+          if (!rcCount) throw new Error("Нет данных RC input");
+          const rcValues = last.rcChannels!.slice(0, rcCount);
+          if (rcValues.some((value) => !Number.isFinite(value) || value === 0xffff))
+            throw new Error("В RC input есть отсутствующие или некорректные каналы");
+          const ammeterFirst = ammeterSamples[0];
+          const ammeterLast = ammeterSamples[ammeterSamples.length - 1];
+          if (latestContext.current.ammeterConnected) {
+            if (
+              !ammeterFirst ||
+              !ammeterLast ||
+              ammeterLast.current === undefined ||
+              !Number.isFinite(ammeterLast.current) ||
+              ammeterLast.voltage === undefined ||
+              !Number.isFinite(ammeterLast.voltage)
+            )
+              throw new Error("Нет корректных данных внешнего амперметра");
+            if (ammeterFirst.messageCount === ammeterLast.messageCount)
+              throw new Error("Не обновляются данные внешнего амперметра");
+          }
+          const range = (values: Array<number | undefined>) => {
+            const finite = values.filter(
+              (value): value is number => value !== undefined && Number.isFinite(value),
+            );
+            return finite.length ? Math.max(...finite) - Math.min(...finite) : 0;
+          };
+          const batteryVoltageRange = range(samples.map((sample) => sample.batteryVoltageV));
+          const batteryCurrentRange = range(samples.map((sample) => sample.batteryCurrentA));
+          const airspeedRange = range(samples.map((sample) => sample.airspeedMps));
+          const pressureRange = range(samples.map((sample) => sample.barometerPressureHpa));
+          const accelerometerXRange = range(samples.map((sample) => sample.accelerometerXMg));
+          const accelerometerYRange = range(samples.map((sample) => sample.accelerometerYMg));
+          const accelerometerZRange = range(samples.map((sample) => sample.accelerometerZMg));
+          const headingRange = range(samples.map((sample) => sample.compassHeadingDeg));
+          const groupChanges = {
+            battery: batteryVoltageRange >= 0.001 || batteryCurrentRange >= 0.01,
+            airspeed: airspeedRange >= 0.01,
+            barometer: pressureRange >= 0.01,
+            imu:
+              accelerometerXRange >= 1 ||
+              accelerometerYRange >= 1 ||
+              accelerometerZRange >= 1 ||
+              headingRange >= 1,
+          };
+          const changing = Object.values(groupChanges).filter(Boolean).length;
+          const state = (changed: boolean) => (changed ? "ИЗМЕНЯЕТСЯ" : "СТАБИЛЬНО");
+          const report = [
+            `Проверено за ${block.seconds} с (${samples.length} снимков):`,
+            `Контроллер — ${last.armed ? "ARMED" : "DISARMED"}`,
+            `Батарея — ${state(groupChanges.battery)}, обновлений: ${last.batteryUpdateCount - first.batteryUpdateCount}`,
+            `  Напряжение: ${last.batteryVoltageV!.toFixed(3)} V; разброс: ${batteryVoltageRange.toFixed(3)} V`,
+            `  Ток: ${last.batteryCurrentA!.toFixed(3)} A; разброс: ${batteryCurrentRange.toFixed(3)} A`,
+            `  Заряд: ${last.batteryRemainingPercent}%`,
+            `ASPD — ${state(groupChanges.airspeed)}, обновлений: ${last.airspeedUpdateCount - first.airspeedUpdateCount}`,
+            `  Значение: ${last.airspeedMps!.toFixed(3)} m/s; разброс: ${airspeedRange.toFixed(3)} m/s`,
+            `Барометр — ${state(groupChanges.barometer)}, обновлений: ${last.barometerUpdateCount - first.barometerUpdateCount}`,
+            `  Давление: ${last.barometerPressureHpa!.toFixed(2)} hPa; разброс: ${pressureRange.toFixed(2)} hPa`,
+            `  Температура: ${last.barometerTemperatureC!.toFixed(1)} °C`,
+            `IMU — ${state(groupChanges.imu)}, обновлений: ${last.imuUpdateCount - first.imuUpdateCount}`,
+            `  Акселерометр: X=${last.accelerometerXMg} mg (разброс ${accelerometerXRange.toFixed(0)}), Y=${last.accelerometerYMg} mg (разброс ${accelerometerYRange.toFixed(0)}), Z=${last.accelerometerZMg} mg (разброс ${accelerometerZRange.toFixed(0)})`,
+            `  Курс компаса: ${last.compassHeadingDeg}°; разброс: ${headingRange.toFixed(0)}°`,
+            `RC input — обновлений: ${last.rcUpdateCount - first.rcUpdateCount}; каналов: ${rcCount}`,
+            `  ${rcValues.map((value, index) => `CH${index + 1}=${value}`).join(", ")}`,
+            ...(latestContext.current.ammeterConnected
+              ? [
+                  `Внешний амперметр — обновлений: ${(ammeterLast!.messageCount ?? 0) - (ammeterFirst!.messageCount ?? 0)}`,
+                  `  Эталонный ток: ${ammeterLast!.current!.toFixed(3)} A; напряжение датчика: ${ammeterLast!.voltage!.toFixed(3)} V`,
+                ]
+              : ["Внешний амперметр — не подключён, на экране не отображается"]),
+            `Итог: изменяются ${changing} из 4 групп (требуется минимум ${block.minimumChangingGroups}).`,
+          ].join("\n");
+          if (changing < block.minimumChangingGroups)
+            throw new Error(`Недостаточно живых показаний.\n${report}`);
+          const zeroValues: string[] = required
+            .filter(([, value]) => value === 0)
+            .map(([label]) => label);
+          rcValues.forEach((value, index) => {
+            if (value === 0) zeroValues.push(`RC CH${index + 1}`);
+          });
+          if (latestContext.current.ammeterConnected) {
+            if (ammeterLast!.current === 0) zeroValues.push("эталонный ток");
+            if (ammeterLast!.voltage === 0) zeroValues.push("напряжение внешнего датчика");
+          }
+          if (zeroValues.length) {
+            entryStatus = "warning";
+            runHasWarnings = true;
+            message = `ВНИМАНИЕ! НУЛЕВЫЕ ПОКАЗАНИЯ: ${zeroValues.join(", ")}.
+ОПЕРАТОР ДОЛЖЕН УТОЧНИТЬ ДАННЫЕ.
+
+${report}`;
+          } else {
+            message = report;
+          }
+        } else if (block.type === "wait") {
           const deadline = Date.now() + block.seconds * 1000;
           while (Date.now() < deadline) {
             await new Promise((resolve) =>
@@ -1635,7 +1831,7 @@ export function ScenarioEditor({ context }: Props) {
             "Моторный backend ещё не активирован: управляющая команда не отправлялась",
           );
         } else message = evaluateImmediateBlock(block, latestContext.current);
-        updateEntry(block.id, { status: "passed", message });
+        updateEntry(block.id, { status: entryStatus, message });
       } catch (error) {
         if (motorActive.current) {
           try {
@@ -1650,12 +1846,13 @@ export function ScenarioEditor({ context }: Props) {
         return;
       }
     }
-    setStatus("passed");
+    setStatus(runHasWarnings ? "warning" : "passed");
   };
   const statusText = {
     idle: "Ещё не запускался",
     running: "Выполняется",
     passed: "Успешно",
+    warning: "Требуется проверка оператора",
     failed: "Ошибка",
     cancelled: "Отменено",
   }[status];
@@ -1825,11 +2022,24 @@ export function ScenarioEditor({ context }: Props) {
             {entries.map((entry) => (
               <div class={`run-entry ${entry.status}`} key={entry.blockId}>
                 <span>
-                  {entry.status === "passed" ? "✓" : entry.status === "failed" ? "×" : "…"}
+                  {entry.status === "passed"
+                    ? "✓"
+                    : entry.status === "warning"
+                      ? "!"
+                      : entry.status === "failed"
+                        ? "×"
+                        : "…"}
                 </span>
                 <div>
                   <strong>{entry.label}</strong>
-                  <p>{entry.message}</p>
+                  {entry.status === "warning" ? (
+                    <>
+                      <div class="run-warning-banner">{entry.message.split("\n\n")[0]}</div>
+                      <p>{entry.message.split("\n\n").slice(1).join("\n\n")}</p>
+                    </>
+                  ) : (
+                    <p>{entry.message}</p>
+                  )}
                 </div>
               </div>
             ))}
