@@ -50,6 +50,26 @@ describe("scenario validation", () => {
       "Блок 1: запуск должен длиться от 0,5 до 5 секунд с шагом 0,5 секунды",
     );
   });
+
+  it("validates safe current-load search limits", () => {
+    const block = {
+      id: "load",
+      type: "findCurrentLoad" as const,
+      targetCurrentA: 20,
+      toleranceA: 2,
+      startThrottlePercent: 10,
+      throttleStepPercent: 2,
+      maximumThrottlePercent: 30,
+      pulseDurationSeconds: 1,
+      holdDurationSeconds: 2,
+      cooldownSeconds: 1,
+      emergencyCurrentA: 40,
+    };
+    expect(validateScenario("Find load", [block])).toEqual([]);
+    expect(validateScenario("Find load", [{ ...block, emergencyCurrentA: 20 }])).toContain(
+      "Блок 1: аварийный ток должен быть выше целевого диапазона",
+    );
+  });
 });
 
 describe("immediate block evaluation", () => {

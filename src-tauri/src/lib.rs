@@ -130,8 +130,8 @@ fn start_motor_rotation_inner(
     throttle_percent: f32,
     duration_seconds: f32,
 ) -> Result<MotorRotationCommand, String> {
-    if !throttle_percent.is_finite() || !(1.0..=30.0).contains(&throttle_percent) {
-        return Err("Для проверки вращения разрешён газ от 1 до 30%".to_owned());
+    if !throttle_percent.is_finite() || !(1.0..=70.0).contains(&throttle_percent) {
+        return Err("Для моторного запуска разрешён газ от 1 до 70% диапазона RC".to_owned());
     }
     if !duration_seconds.is_finite() || !(0.1..=5.0).contains(&duration_seconds) {
         return Err("Проверка вращения должна длиться от 0.1 до 5 секунд".to_owned());

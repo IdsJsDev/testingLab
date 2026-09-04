@@ -46,6 +46,19 @@ export type ScenarioBlock =
     }
   | {
       id: string;
+      type: "findCurrentLoad";
+      targetCurrentA: number;
+      toleranceA: number;
+      startThrottlePercent: number;
+      throttleStepPercent: number;
+      maximumThrottlePercent: number;
+      pulseDurationSeconds: number;
+      holdDurationSeconds: number;
+      cooldownSeconds: number;
+      emergencyCurrentA: number;
+    }
+  | {
+      id: string;
       type: "tuneRcMaxByCurrent";
       parameterName: string;
       targetCurrentA: number;
@@ -173,6 +186,24 @@ export const blockCatalog: BlockDefinition[] = [
     }),
   },
   {
+    type: "findCurrentLoad",
+    label: "Найти нагрузку по току",
+    description: "Короткими импульсами повышает газ и ищет заданный ток внешнего амперметра.",
+    create: (id) => ({
+      id,
+      type: "findCurrentLoad",
+      targetCurrentA: 20,
+      toleranceA: 2,
+      startThrottlePercent: 28,
+      throttleStepPercent: 2,
+      maximumThrottlePercent: 65,
+      pulseDurationSeconds: 1,
+      holdDurationSeconds: 2,
+      cooldownSeconds: 0.5,
+      emergencyCurrentA: 35,
+    }),
+  },
+  {
     type: "measureMaximumCurrent",
     label: "Измерить максимальный ток",
     description: "Коротко подаёт полный газ и фиксирует средний и пиковый внешний ток.",
@@ -208,10 +239,10 @@ export const blockCatalog: BlockDefinition[] = [
       type: "calibrateControllerCurrent",
       parameterName: "BATT_AMP_PERVLT",
       targetCurrentA: 20,
-      targetToleranceA: 1,
-      comparisonToleranceA: 0.5,
-      maximumDurationSeconds: 10,
-      emergencyCurrentA: 40,
+      targetToleranceA: 2,
+      comparisonToleranceA: 1,
+      maximumDurationSeconds: 2,
+      emergencyCurrentA: 35,
     }),
   },
 ];
@@ -271,6 +302,39 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
       if (block.settlingSeconds < 0 || block.settlingSeconds >= block.durationSeconds)
         errors.push(`${prefix}: некорректное время стабилизации`);
       if (block.emergencyCurrentA <= 0) errors.push(`${prefix}: укажите аварийный ток`);
+    } else if (block.type === "findCurrentLoad") {
+      if (block.targetCurrentA <= 0 || block.toleranceA < 0)
+        errors.push(`${prefix}: некорректная цель или допуск тока`);
+      if (
+        block.startThrottlePercent < 1 ||
+        block.maximumThrottlePercent > 70 ||
+        block.startThrottlePercent >= block.maximumThrottlePercent ||
+        block.throttleStepPercent <= 0
+      )
+        errors.push(`${prefix}: газ должен возрастать в пределах 1…70% диапазона RC`);
+      if (
+        block.pulseDurationSeconds < 0.5 ||
+        block.pulseDurationSeconds > 5 ||
+        Math.abs(block.pulseDurationSeconds * 2 - Math.round(block.pulseDurationSeconds * 2)) >
+          1e-6
+      )
+        errors.push(`${prefix}: импульс должен быть от 0,5 до 5 секунд с шагом 0,5`);
+      if (
+        block.cooldownSeconds < 0.5 ||
+        block.cooldownSeconds > 5 ||
+        Math.abs(block.cooldownSeconds * 2 - Math.round(block.cooldownSeconds * 2)) > 1e-6
+      )
+        errors.push(`${prefix}: пауза должна быть от 0,5 до 5 секунд с шагом 0,5`);
+      if (
+        !Number.isFinite(block.holdDurationSeconds) ||
+        block.holdDurationSeconds < 0.5 ||
+        block.holdDurationSeconds > 5 ||
+        Math.abs(block.holdDurationSeconds * 2 - Math.round(block.holdDurationSeconds * 2)) >
+          1e-6
+      )
+        errors.push(`${prefix}: удержание должно быть от 0,5 до 5 секунд с шагом 0,5`);
+      if (block.emergencyCurrentA <= block.targetCurrentA + block.toleranceA)
+        errors.push(`${prefix}: аварийный ток должен быть выше целевого диапазона`);
     } else if (block.type === "tuneRcMaxByCurrent") {
       if (!block.parameterName.trim()) errors.push(`${prefix}: укажите параметр RC MAX`);
       if (block.targetCurrentA <= 0 || block.toleranceA < 0)
@@ -289,8 +353,8 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
       if (!block.parameterName.trim()) errors.push(`${prefix}: укажите параметр масштаба`);
       if (block.targetCurrentA <= 0 || block.targetToleranceA < 0 || block.comparisonToleranceA < 0)
         errors.push(`${prefix}: некорректные токи или допуски`);
-      if (block.maximumDurationSeconds <= 0 || block.maximumDurationSeconds > 30)
-        errors.push(`${prefix}: длительность должна быть от 0 до 30 секунд`);
+      if (block.maximumDurationSeconds < 0.5 || block.maximumDurationSeconds > 5)
+        errors.push(`${prefix}: длительность должна быть от 0,5 до 5 секунд`);
       if (block.emergencyCurrentA <= block.targetCurrentA)
         errors.push(`${prefix}: аварийный ток должен быть выше целевого`);
     }
