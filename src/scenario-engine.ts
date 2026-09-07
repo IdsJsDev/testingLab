@@ -35,13 +35,139 @@ export type ScenarioContext = {
   parameters: Array<{ name: string; value: number }>;
 };
 
+export type TelemetrySignal =
+  | "batteryVoltageV"
+  | "batteryCurrentA"
+  | "batteryRemainingPercent"
+  | "airspeedMps"
+  | "barometerPressureHpa"
+  | "barometerTemperatureC"
+  | "accelerometerXMg"
+  | "accelerometerYMg"
+  | "accelerometerZMg"
+  | "compassHeadingDeg";
+
+export type TelemetryBehavior = "any" | "changing" | "stable";
+
+export const telemetrySignalCatalog: Array<{
+  id: TelemetrySignal;
+  label: string;
+  unit: string;
+  updateCounter:
+    "batteryUpdateCount" | "airspeedUpdateCount" | "barometerUpdateCount" | "imuUpdateCount";
+  defaultMinimum: number;
+  defaultMaximum: number;
+  defaultVariation: number;
+}> = [
+  {
+    id: "batteryVoltageV",
+    label: "Напряжение батареи",
+    unit: "V",
+    updateCounter: "batteryUpdateCount",
+    defaultMinimum: 5,
+    defaultMaximum: 60,
+    defaultVariation: 0.001,
+  },
+  {
+    id: "batteryCurrentA",
+    label: "Ток контроллера",
+    unit: "A",
+    updateCounter: "batteryUpdateCount",
+    defaultMinimum: -2,
+    defaultMaximum: 250,
+    defaultVariation: 0.01,
+  },
+  {
+    id: "batteryRemainingPercent",
+    label: "Остаток заряда",
+    unit: "%",
+    updateCounter: "batteryUpdateCount",
+    defaultMinimum: 0,
+    defaultMaximum: 100,
+    defaultVariation: 1,
+  },
+  {
+    id: "airspeedMps",
+    label: "Воздушная скорость",
+    unit: "m/s",
+    updateCounter: "airspeedUpdateCount",
+    defaultMinimum: 0,
+    defaultMaximum: 100,
+    defaultVariation: 0.01,
+  },
+  {
+    id: "barometerPressureHpa",
+    label: "Давление барометра",
+    unit: "hPa",
+    updateCounter: "barometerUpdateCount",
+    defaultMinimum: 700,
+    defaultMaximum: 1100,
+    defaultVariation: 0.01,
+  },
+  {
+    id: "barometerTemperatureC",
+    label: "Температура барометра",
+    unit: "°C",
+    updateCounter: "barometerUpdateCount",
+    defaultMinimum: -30,
+    defaultMaximum: 85,
+    defaultVariation: 0.1,
+  },
+  {
+    id: "accelerometerXMg",
+    label: "Акселерометр X",
+    unit: "mg",
+    updateCounter: "imuUpdateCount",
+    defaultMinimum: -4000,
+    defaultMaximum: 4000,
+    defaultVariation: 1,
+  },
+  {
+    id: "accelerometerYMg",
+    label: "Акселерометр Y",
+    unit: "mg",
+    updateCounter: "imuUpdateCount",
+    defaultMinimum: -4000,
+    defaultMaximum: 4000,
+    defaultVariation: 1,
+  },
+  {
+    id: "accelerometerZMg",
+    label: "Акселерометр Z",
+    unit: "mg",
+    updateCounter: "imuUpdateCount",
+    defaultMinimum: -4000,
+    defaultMaximum: 4000,
+    defaultVariation: 1,
+  },
+  {
+    id: "compassHeadingDeg",
+    label: "Курс компаса",
+    unit: "°",
+    updateCounter: "imuUpdateCount",
+    defaultMinimum: 0,
+    defaultMaximum: 359,
+    defaultVariation: 1,
+  },
+];
+
 export type ScenarioBlock =
   | { id: string; type: "requireController" }
   | { id: string; type: "requireAmmeter" }
   | { id: string; type: "requireDisarmed" }
   | { id: string; type: "parameterEquals"; name: string; expected: number; tolerance: number }
   | { id: string; type: "currentInRange"; minimum: number; maximum: number }
-  | { id: string; type: "checkTelemetryAlive"; seconds: number; minimumChangingGroups: number }
+  | {
+      id: string;
+      type: "checkTelemetrySignal";
+      signal: TelemetrySignal;
+      durationSeconds: number;
+      minimum: number;
+      maximum: number;
+      requireUpdates: boolean;
+      behavior: TelemetryBehavior;
+      variation: number;
+    }
   | { id: string; type: "wait"; seconds: number }
   | {
       id: string;
@@ -50,7 +176,6 @@ export type ScenarioBlock =
       intervalSeconds: number;
     }
   | { id: string; type: "operatorConfirmation"; message: string }
-  | { id: string; type: "resultMessage"; message: string }
   | { id: string; type: "prepareMotorTest"; maximumIdleCurrentA: number }
   | { id: string; type: "armController"; force: boolean }
   | { id: string; type: "disarmController" }
@@ -90,6 +215,17 @@ export type ScenarioBlock =
       toleranceA: number;
       emergencyCurrentA: number;
       maximumAttempts: number;
+      cooldownSeconds: number;
+    }
+  | {
+      id: string;
+      type: "limitMaximumCurrent";
+      parameterName: string;
+      targetCurrentA: number;
+      toleranceA: number;
+      emergencyCurrentA: number;
+      rampDurationSeconds: number;
+      peakHoldSeconds: number;
       cooldownSeconds: number;
     }
   | {
@@ -144,10 +280,21 @@ export const blockCatalog: BlockDefinition[] = [
     }),
   },
   {
-    type: "checkTelemetryAlive",
-    label: "Проверить живую телеметрию",
-    description: "Проверяет наличие, обновление и небольшие изменения основных датчиков.",
-    create: (id) => ({ id, type: "checkTelemetryAlive", seconds: 5, minimumChangingGroups: 2 }),
+    type: "checkTelemetrySignal",
+    label: "Проверить сигнал телеметрии",
+    description:
+      "Проверяет выбранное показание, его диапазон, обновление и изменение за заданное время.",
+    create: (id) => ({
+      id,
+      type: "checkTelemetrySignal",
+      signal: "batteryVoltageV",
+      durationSeconds: 3,
+      minimum: 5,
+      maximum: 60,
+      requireUpdates: true,
+      behavior: "any",
+      variation: 0.001,
+    }),
   },
   {
     type: "currentInRange",
@@ -177,12 +324,6 @@ export const blockCatalog: BlockDefinition[] = [
     label: "Подтверждение оператора",
     description: "Останавливает выполнение до явного подтверждения.",
     create: (id) => ({ id, type: "operatorConfirmation", message: "Стенд подготовлен к проверке" }),
-  },
-  {
-    type: "resultMessage",
-    label: "Добавить результат",
-    description: "Добавляет произвольную строку в протокол выполнения.",
-    create: (id) => ({ id, type: "resultMessage", message: "Проверка завершена" }),
   },
   {
     type: "prepareMotorTest",
@@ -262,6 +403,23 @@ export const blockCatalog: BlockDefinition[] = [
     }),
   },
   {
+    type: "limitMaximumCurrent",
+    label: "Измерить и ограничить максимальный ток",
+    description:
+      "Плавно выводит двигатель на полный газ, измеряет пик и по решению оператора корректирует RC MAX до целевого диапазона.",
+    create: (id) => ({
+      id,
+      type: "limitMaximumCurrent",
+      parameterName: "RC1_MAX",
+      targetCurrentA: 160,
+      toleranceA: 3,
+      emergencyCurrentA: 250,
+      rampDurationSeconds: 0.75,
+      peakHoldSeconds: 0.5,
+      cooldownSeconds: 5,
+    }),
+  },
+  {
     type: "calibrateControllerCurrent",
     label: "Откалибровать ток контроллера",
     description: "Находит нагрузку 20 А и один раз корректирует BATT_AMP_PERVLT под нагрузкой.",
@@ -279,6 +437,10 @@ export const blockCatalog: BlockDefinition[] = [
 ];
 
 export function blockLabel(block: ScenarioBlock) {
+  if (block.type === "checkTelemetrySignal") {
+    const signal = telemetrySignalCatalog.find((item) => item.id === block.signal);
+    return signal ? `Проверить: ${signal.label}` : "Проверить сигнал телеметрии";
+  }
   return blockCatalog.find((item) => item.type === block.type)?.label ?? block.type;
 }
 
@@ -288,6 +450,10 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
   if (!blocks.length) errors.push("Добавьте хотя бы один блок");
   blocks.forEach((block, index) => {
     const prefix = `Блок ${index + 1}`;
+    if (!blockCatalog.some((definition) => definition.type === block.type)) {
+      errors.push(`${prefix}: неизвестный или устаревший тип блока ${String(block.type)}`);
+      return;
+    }
     if (block.type === "parameterEquals") {
       if (!block.name.trim()) errors.push(`${prefix}: укажите имя параметра`);
       if (![block.expected, block.tolerance].every(Number.isFinite) || block.tolerance < 0)
@@ -295,15 +461,19 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
     } else if (block.type === "currentInRange") {
       if (![block.minimum, block.maximum].every(Number.isFinite) || block.minimum > block.maximum)
         errors.push(`${prefix}: некорректный диапазон тока`);
-    } else if (block.type === "checkTelemetryAlive") {
-      if (!Number.isFinite(block.seconds) || block.seconds < 2 || block.seconds > 30)
-        errors.push(`${prefix}: проверка телеметрии должна длиться от 2 до 30 секунд`);
+    } else if (block.type === "checkTelemetrySignal") {
+      if (!telemetrySignalCatalog.some((signal) => signal.id === block.signal))
+        errors.push(`${prefix}: выберите известный сигнал телеметрии`);
       if (
-        !Number.isInteger(block.minimumChangingGroups) ||
-        block.minimumChangingGroups < 1 ||
-        block.minimumChangingGroups > 4
+        !Number.isFinite(block.durationSeconds) ||
+        block.durationSeconds < 1 ||
+        block.durationSeconds > 30
       )
-        errors.push(`${prefix}: число изменяющихся групп должно быть от 1 до 4`);
+        errors.push(`${prefix}: проверка сигнала должна длиться от 1 до 30 секунд`);
+      if (![block.minimum, block.maximum].every(Number.isFinite) || block.minimum > block.maximum)
+        errors.push(`${prefix}: некорректный допустимый диапазон`);
+      if (!Number.isFinite(block.variation) || block.variation < 0)
+        errors.push(`${prefix}: изменение должно быть неотрицательным числом`);
     } else if (block.type === "wait") {
       if (!Number.isFinite(block.seconds) || block.seconds < 0 || block.seconds > 300)
         errors.push(`${prefix}: ожидание должно быть от 0 до 300 секунд`);
@@ -316,10 +486,7 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
         block.intervalSeconds > 60
       )
         errors.push(`${prefix}: интервал должен быть от 0 до 60 секунд`);
-    } else if (
-      (block.type === "operatorConfirmation" || block.type === "resultMessage") &&
-      !block.message.trim()
-    ) {
+    } else if (block.type === "operatorConfirmation" && !block.message.trim()) {
       errors.push(`${prefix}: текст не может быть пустым`);
     } else if (block.type === "prepareMotorTest") {
       if (!Number.isFinite(block.maximumIdleCurrentA) || block.maximumIdleCurrentA < 0)
@@ -387,6 +554,18 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
         errors.push(`${prefix}: число попыток должно быть от 1 до 10`);
       if (block.cooldownSeconds < 0 || block.cooldownSeconds > 300)
         errors.push(`${prefix}: пауза должна быть от 0 до 300 секунд`);
+    } else if (block.type === "limitMaximumCurrent") {
+      if (!block.parameterName.trim()) errors.push(`${prefix}: укажите параметр RC MAX`);
+      if (block.targetCurrentA <= 0 || block.toleranceA < 0)
+        errors.push(`${prefix}: некорректная цель или допуск тока`);
+      if (block.emergencyCurrentA <= block.targetCurrentA + block.toleranceA)
+        errors.push(`${prefix}: аварийный ток должен быть выше целевого диапазона`);
+      if (block.rampDurationSeconds < 0.5 || block.rampDurationSeconds > 1)
+        errors.push(`${prefix}: плавный набор должен длиться от 0,5 до 1 секунды`);
+      if (block.peakHoldSeconds < 0.1 || block.peakHoldSeconds > 1)
+        errors.push(`${prefix}: удержание полного газа должно длиться от 0,1 до 1 секунды`);
+      if (block.cooldownSeconds < 0 || block.cooldownSeconds > 300)
+        errors.push(`${prefix}: пауза должна быть от 0 до 300 секунд`);
     } else if (block.type === "calibrateControllerCurrent") {
       if (!block.parameterName.trim()) errors.push(`${prefix}: укажите параметр масштаба`);
       if (block.targetCurrentA <= 0 || block.targetToleranceA < 0 || block.comparisonToleranceA < 0)
@@ -426,8 +605,6 @@ export function evaluateImmediateBlock(block: ScenarioBlock, context: ScenarioCo
           `Ток ${context.ammeterCurrentA.toFixed(3)} A вне диапазона ${block.minimum}…${block.maximum} A`,
         );
       return `Ток ${context.ammeterCurrentA.toFixed(3)} A входит в диапазон ${block.minimum}…${block.maximum} A`;
-    case "resultMessage":
-      return block.message.trim();
     default:
       throw new Error("Блок требует асинхронного исполнения");
   }

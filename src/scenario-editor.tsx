@@ -6,6 +6,7 @@ import {
   blockLabel,
   evaluateImmediateBlock,
   evaluateParameterValue,
+  telemetrySignalCatalog,
   validateScenario,
   type BlockType,
   type ScenarioBlock,
@@ -17,6 +18,18 @@ type RunEntry = {
   label: string;
   status: "running" | "passed" | "warning" | "failed";
   message: string;
+};
+type SavedRunReport = {
+  format: "uav-test-station-report";
+  version: 1;
+  id: string;
+  scenarioId: string;
+  scenarioName: string;
+  serialNumber?: string;
+  startedAt: string;
+  finishedAt: string;
+  status: "passed" | "warning" | "failed" | "cancelled";
+  entries: RunEntry[];
 };
 type FreshParameter = { name: string; value: number };
 type MotorRotationCommand = {
@@ -51,15 +64,11 @@ type ScenarioFile = {
 };
 
 const STORAGE_KEY = "uav-test-station.scenarios.v1";
-const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v19";
-const safetyConfirmation = {
-  type: "operatorConfirmation" as const,
-  message: "БПЛА закреплён, защитная зона свободна, аварийное отключение готово",
-};
-
+const SERIAL_NUMBER_KEY = "uav-test-station.device-serial-number.v1";
+const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v25";
 const motorTestTemplate: SavedScenario = {
   id: "built-in-motor-test-v1",
-  name: "Тест двигателя БПЛА",
+  name: "04 — Тест двигателя БПЛА",
   updatedAt: Date.now(),
   blocks: [
     { id: "motor-1", type: "prepareMotorTest", maximumIdleCurrentA: 1 },
@@ -109,7 +118,6 @@ const motorTestTemplate: SavedScenario = {
       emergencyCurrentA: 35,
     },
     { id: "motor-8", type: "disarmController" },
-    { id: "motor-9", type: "resultMessage", message: "Тест двигателя завершён" },
   ],
 };
 
@@ -120,13 +128,17 @@ const motorTestTemplates: SavedScenario[] = [
     updatedAt: Date.now(),
     blocks: [
       { id: "telemetry-1", type: "requireController" },
-      {
-        id: "telemetry-2",
-        type: "checkTelemetryAlive",
-        seconds: 5,
-        minimumChangingGroups: 2,
-      },
-      { id: "telemetry-3", type: "resultMessage", message: "Основная телеметрия проверена" },
+      ...telemetrySignalCatalog.map((signal, index) => ({
+        id: `telemetry-${index + 2}`,
+        type: "checkTelemetrySignal" as const,
+        signal: signal.id,
+        durationSeconds: 2,
+        minimum: signal.defaultMinimum,
+        maximum: signal.defaultMaximum,
+        requireUpdates: true,
+        behavior: "any" as const,
+        variation: signal.defaultVariation,
+      })),
     ],
   },
   {
@@ -134,8 +146,8 @@ const motorTestTemplates: SavedScenario[] = [
     name: "01 — Проверка вращения двигателя",
     updatedAt: Date.now(),
     blocks: [
-      { id: "rotation-1", type: "prepareMotorTest", maximumIdleCurrentA: 1 },
-      { id: "rotation-2", ...safetyConfirmation },
+      { id: "rotation-1", type: "requireController" },
+      { id: "rotation-2", type: "sound", repeats: 3, intervalSeconds: 0.5 },
       { id: "rotation-3", type: "armController", force: true },
       {
         id: "rotation-4",
@@ -146,94 +158,34 @@ const motorTestTemplates: SavedScenario[] = [
         confirmation: "Пропеллер вращается в правильном направлении?",
       },
       { id: "rotation-5", type: "disarmController" },
-      { id: "rotation-6", type: "resultMessage", message: "Направление вращения проверено" },
     ],
   },
   {
-    id: "built-in-maximum-current-v1",
-    name: "02 — Измерение максимального тока",
+    id: "built-in-maximum-current-limiting-v1",
+    name: "02 — Измерение и ограничение максимального тока",
     updatedAt: Date.now(),
     blocks: [
-      { id: "maximum-1", type: "prepareMotorTest", maximumIdleCurrentA: 1 },
-      { id: "maximum-2", ...safetyConfirmation },
+      { id: "maximum-limit-1", type: "prepareMotorTest", maximumIdleCurrentA: 1 },
       {
-        id: "maximum-3",
-        type: "measureMaximumCurrent",
-        durationSeconds: 2,
-        settlingSeconds: 0.5,
-        emergencyCurrentA: 250,
-      },
-      {
-        id: "maximum-4",
-        type: "resultMessage",
-        message: "Максимальный ток двигателя измерен",
-      },
-    ],
-  },
-  {
-    id: "built-in-rc-max-tuning-v1",
-    name: "03 — Настройка максимального тока 160 А",
-    updatedAt: Date.now(),
-    blocks: [
-      { id: "rcmax-1", type: "prepareMotorTest", maximumIdleCurrentA: 1 },
-      { id: "rcmax-2", ...safetyConfirmation },
-      {
-        id: "rcmax-3",
-        type: "tuneRcMaxByCurrent",
+        id: "maximum-limit-2",
+        type: "limitMaximumCurrent",
         parameterName: "RC1_MAX",
         targetCurrentA: 160,
         toleranceA: 3,
         emergencyCurrentA: 250,
-        maximumAttempts: 6,
+        rampDurationSeconds: 0.75,
+        peakHoldSeconds: 0.5,
         cooldownSeconds: 5,
-      },
-      { id: "rcmax-4", type: "resultMessage", message: "Ограничение максимального тока настроено" },
-    ],
-  },
-  {
-    id: "built-in-current-calibration-v1",
-    name: "04 — Калибровка тока на 20 А",
-    updatedAt: Date.now(),
-    blocks: [
-      { id: "calibration-1", type: "prepareMotorTest", maximumIdleCurrentA: 1 },
-      { id: "calibration-2", ...safetyConfirmation },
-      {
-        id: "calibration-3",
-        type: "findCurrentLoad",
-        targetCurrentA: 20,
-        toleranceA: 2,
-        startThrottlePercent: 28,
-        throttleStepPercent: 2,
-        maximumThrottlePercent: 65,
-        pulseDurationSeconds: 1,
-        holdDurationSeconds: 2,
-        cooldownSeconds: 0.5,
-        emergencyCurrentA: 35,
-      },
-      {
-        id: "calibration-4",
-        type: "calibrateControllerCurrent",
-        parameterName: "BATT_AMP_PERVLT",
-        targetCurrentA: 20,
-        targetToleranceA: 2,
-        comparisonToleranceA: 1,
-        maximumDurationSeconds: 2,
-        emergencyCurrentA: 35,
-      },
-      {
-        id: "calibration-5",
-        type: "resultMessage",
-        message: "Показания тока контроллера откалиброваны",
       },
     ],
   },
   {
     id: "built-in-find-current-load-v1",
-    name: "05 — Поиск нагрузки 20 А",
+    name: "03 — Калибровка тока на 20 А",
     updatedAt: Date.now(),
     blocks: [
       { id: "find-load-1", type: "prepareMotorTest", maximumIdleCurrentA: 1 },
-      { id: "find-load-2", ...safetyConfirmation },
+      { id: "find-load-2", type: "sound", repeats: 3, intervalSeconds: 0.5 },
       {
         id: "find-load-3",
         type: "findCurrentLoad",
@@ -258,11 +210,6 @@ const motorTestTemplates: SavedScenario[] = [
         emergencyCurrentA: 35,
       },
       { id: "find-load-5", type: "disarmController" },
-      {
-        id: "find-load-6",
-        type: "resultMessage",
-        message: "Нагрузка 20 А найдена, FCA откалиброван по CA",
-      },
     ],
   },
   motorTestTemplate,
@@ -275,18 +222,16 @@ function loadScenarios(): SavedScenario[] {
     if (localStorage.getItem(TEMPLATE_SEEDED_KEY) !== "1") {
       localStorage.setItem(TEMPLATE_SEEDED_KEY, "1");
       const updatedBuiltIns = new Map(
-        motorTestTemplates
-          .filter(
-            (template) =>
-              template.id === "built-in-motor-rotation-v1" ||
-              template.id === "built-in-telemetry-check-v1" ||
-              template.id === "built-in-find-current-load-v1" ||
-              template.id === "built-in-current-calibration-v1" ||
-              template.id === motorTestTemplate.id,
-          )
-          .map((template) => [template.id, template]),
+        motorTestTemplates.map((template) => [template.id, template]),
       );
-      const migrated = scenarios.map((scenario) => updatedBuiltIns.get(scenario.id) ?? scenario);
+      const retiredBuiltInIds = new Set([
+        "built-in-maximum-current-v1",
+        "built-in-rc-max-tuning-v1",
+        "built-in-current-calibration-v1",
+      ]);
+      const migrated = scenarios
+        .filter((scenario) => !retiredBuiltInIds.has(scenario.id))
+        .map((scenario) => updatedBuiltIns.get(scenario.id) ?? scenario);
       const existingIds = new Set(migrated.map((item) => item.id));
       return [...motorTestTemplates.filter((item) => !existingIds.has(item.id)), ...migrated];
     }
@@ -313,6 +258,61 @@ async function playComputerTone() {
   await audio.close();
 }
 
+type TelemetryCheckBlock = Extract<ScenarioBlock, { type: "checkTelemetrySignal" }>;
+type TimedTelemetrySample = {
+  elapsedMs: number;
+  telemetry: NonNullable<ScenarioContext["telemetry"]>;
+};
+
+function evaluateTelemetryCheck(
+  block: TelemetryCheckBlock,
+  allSamples: TimedTelemetrySample[],
+): string {
+  const definition = telemetrySignalCatalog.find((signal) => signal.id === block.signal);
+  if (!definition) throw new Error(`Неизвестный сигнал телеметрии: ${block.signal}`);
+  const samples = allSamples
+    .filter((sample) => sample.elapsedMs <= block.durationSeconds * 1000)
+    .map((sample) => sample.telemetry);
+  if (samples.length < 2) throw new Error(`Не получены данные: ${definition.label}`);
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const values = samples
+    .map((sample) => sample[block.signal])
+    .filter((value): value is number => value !== undefined && Number.isFinite(value));
+  if (!values.length) throw new Error(`Нет корректных данных: ${definition.label}`);
+  if (block.requireUpdates && first[definition.updateCounter] === last[definition.updateCounter])
+    throw new Error(`Не обновляются данные: ${definition.label}`);
+  const latest = values[values.length - 1];
+  const minimumObserved = Math.min(...values);
+  const maximumObserved = Math.max(...values);
+  const variation = maximumObserved - minimumObserved;
+  if (values.some((value) => value < block.minimum || value > block.maximum))
+    throw new Error(
+      `${definition.label}: зафиксировано ${minimumObserved.toFixed(3)}…${maximumObserved.toFixed(3)} ${definition.unit}, допустимо ${block.minimum}…${block.maximum} ${definition.unit}`,
+    );
+  if (block.behavior === "changing" && variation < block.variation)
+    throw new Error(
+      `${definition.label} не изменяется достаточно: ${variation.toFixed(3)} ${definition.unit}, требуется не менее ${block.variation} ${definition.unit}`,
+    );
+  if (block.behavior === "stable" && variation > block.variation)
+    throw new Error(
+      `${definition.label} нестабилен: ${variation.toFixed(3)} ${definition.unit}, допускается не более ${block.variation} ${definition.unit}`,
+    );
+  const behaviorText =
+    block.behavior === "changing"
+      ? `изменение не менее ${block.variation} ${definition.unit}`
+      : block.behavior === "stable"
+        ? `изменение не более ${block.variation} ${definition.unit}`
+        : "изменение не ограничено";
+  return [
+    `${definition.label}: ${latest.toFixed(3)} ${definition.unit}`,
+    `Наблюдалось: ${minimumObserved.toFixed(3)}…${maximumObserved.toFixed(3)} ${definition.unit}`,
+    `Допустимо: ${block.minimum}…${block.maximum} ${definition.unit}`,
+    `Разброс: ${variation.toFixed(3)} ${definition.unit}; ${behaviorText}`,
+    `Новых сообщений группы: ${last[definition.updateCounter] - first[definition.updateCounter]}`,
+  ].join("\n");
+}
+
 function Fields({
   block,
   replace,
@@ -322,37 +322,115 @@ function Fields({
   replace: (value: ScenarioBlock) => void;
   disabled: boolean;
 }) {
-  if (block.type === "checkTelemetryAlive")
+  if (block.type === "checkTelemetrySignal") {
+    const definition =
+      telemetrySignalCatalog.find((signal) => signal.id === block.signal) ??
+      telemetrySignalCatalog[0];
     return (
-      <div class="block-fields">
+      <div class="block-fields three-fields">
+        <label>
+          Сигнал
+          <select
+            disabled={disabled}
+            value={block.signal}
+            onChange={(event) => {
+              const next = telemetrySignalCatalog.find(
+                (signal) => signal.id === event.currentTarget.value,
+              );
+              if (!next) return;
+              replace({
+                ...block,
+                signal: next.id,
+                minimum: next.defaultMinimum,
+                maximum: next.defaultMaximum,
+                variation: next.defaultVariation,
+              });
+            }}
+          >
+            {telemetrySignalCatalog.map((signal) => (
+              <option value={signal.id}>{signal.label}</option>
+            ))}
+          </select>
+        </label>
         <label>
           Время проверки, с
           <input
             disabled={disabled}
             type="number"
-            min="2"
+            min="1"
             max="30"
             step="1"
-            value={block.seconds}
-            onInput={(e) => replace({ ...block, seconds: e.currentTarget.valueAsNumber })}
-          />
-        </label>
-        <label>
-          Минимум изменяющихся групп
-          <input
-            disabled={disabled}
-            type="number"
-            min="1"
-            max="4"
-            step="1"
-            value={block.minimumChangingGroups}
-            onInput={(e) =>
-              replace({ ...block, minimumChangingGroups: e.currentTarget.valueAsNumber })
+            value={block.durationSeconds}
+            onInput={(event) =>
+              replace({ ...block, durationSeconds: event.currentTarget.valueAsNumber })
             }
           />
         </label>
+        <label>
+          Минимум, {definition.unit}
+          <input
+            disabled={disabled}
+            type="number"
+            step="any"
+            value={block.minimum}
+            onInput={(event) => replace({ ...block, minimum: event.currentTarget.valueAsNumber })}
+          />
+        </label>
+        <label>
+          Максимум, {definition.unit}
+          <input
+            disabled={disabled}
+            type="number"
+            step="any"
+            value={block.maximum}
+            onInput={(event) => replace({ ...block, maximum: event.currentTarget.valueAsNumber })}
+          />
+        </label>
+        <label>
+          Поведение
+          <select
+            disabled={disabled}
+            value={block.behavior}
+            onChange={(event) =>
+              replace({
+                ...block,
+                behavior: event.currentTarget.value as typeof block.behavior,
+              })
+            }
+          >
+            <option value="any">Может быть стабильным</option>
+            <option value="changing">Должен изменяться</option>
+            <option value="stable">Должен быть стабильным</option>
+          </select>
+        </label>
+        {block.behavior !== "any" && (
+          <label>
+            {block.behavior === "changing" ? "Минимальное" : "Максимальное"} изменение,{" "}
+            {definition.unit}
+            <input
+              disabled={disabled}
+              type="number"
+              min="0"
+              step="any"
+              value={block.variation}
+              onInput={(event) =>
+                replace({ ...block, variation: event.currentTarget.valueAsNumber })
+              }
+            />
+          </label>
+        )}
+        <label class="checkbox-field">
+          <input
+            disabled={disabled}
+            type="checkbox"
+            checked={block.requireUpdates}
+            onChange={(event) => replace({ ...block, requireUpdates: event.currentTarget.checked })}
+          />
+          Требовать новые данные
+        </label>
       </div>
     );
+  }
   if (block.type === "parameterEquals")
     return (
       <div class="block-fields three-fields">
@@ -457,7 +535,7 @@ function Fields({
         </label>
       </div>
     );
-  if (block.type === "operatorConfirmation" || block.type === "resultMessage")
+  if (block.type === "operatorConfirmation")
     return (
       <div class="block-fields">
         <label>
@@ -652,6 +730,89 @@ function Fields({
             max="300"
             value={block.cooldownSeconds}
             onInput={(e) => replace({ ...block, cooldownSeconds: e.currentTarget.valueAsNumber })}
+          />
+        </label>
+      </div>
+    );
+  if (block.type === "limitMaximumCurrent")
+    return (
+      <div class="block-fields three-fields">
+        <label>
+          Параметр ограничения
+          <input
+            disabled={disabled}
+            value={block.parameterName}
+            onInput={(e) =>
+              replace({ ...block, parameterName: e.currentTarget.value.toUpperCase() })
+            }
+          />
+        </label>
+        <label>
+          Целевой ток, A
+          <input
+            disabled={disabled}
+            type="number"
+            min="1"
+            value={block.targetCurrentA}
+            onInput={(e) => replace({ ...block, targetCurrentA: e.currentTarget.valueAsNumber })}
+          />
+        </label>
+        <label>
+          Допуск, A
+          <input
+            disabled={disabled}
+            type="number"
+            min="0"
+            step="0.1"
+            value={block.toleranceA}
+            onInput={(e) => replace({ ...block, toleranceA: e.currentTarget.valueAsNumber })}
+          />
+        </label>
+        <label>
+          Набор газа, с
+          <input
+            disabled={disabled}
+            type="number"
+            min="0.5"
+            max="1"
+            step="0.05"
+            value={block.rampDurationSeconds}
+            onInput={(e) =>
+              replace({ ...block, rampDurationSeconds: e.currentTarget.valueAsNumber })
+            }
+          />
+        </label>
+        <label>
+          Удержание 100%, с
+          <input
+            disabled={disabled}
+            type="number"
+            min="0.1"
+            max="1"
+            step="0.1"
+            value={block.peakHoldSeconds}
+            onInput={(e) => replace({ ...block, peakHoldSeconds: e.currentTarget.valueAsNumber })}
+          />
+        </label>
+        <label>
+          Пауза между циклами, с
+          <input
+            disabled={disabled}
+            type="number"
+            min="0"
+            max="300"
+            value={block.cooldownSeconds}
+            onInput={(e) => replace({ ...block, cooldownSeconds: e.currentTarget.valueAsNumber })}
+          />
+        </label>
+        <label>
+          Аварийный ток, A
+          <input
+            disabled={disabled}
+            type="number"
+            min="1"
+            value={block.emergencyCurrentA}
+            onInput={(e) => replace({ ...block, emergencyCurrentA: e.currentTarget.valueAsNumber })}
           />
         </label>
       </div>
@@ -852,8 +1013,12 @@ export function ScenarioEditor({ context }: Props) {
   const [savedScenarios, setSavedScenarios] = useState<SavedScenario[]>(loadScenarios);
   const [scenarioId, setScenarioId] = useState<string>(() => crypto.randomUUID());
   const [name, setName] = useState("Новый сценарий");
+  const [serialNumber, setSerialNumber] = useState(
+    () => localStorage.getItem(SERIAL_NUMBER_KEY) ?? "",
+  );
   const [blocks, setBlocks] = useState<ScenarioBlock[]>([]);
   const [page, setPage] = useState<"list" | "editor">("list");
+  const [scenarioSort, setScenarioSort] = useState<"name" | "updatedAt">("name");
   const [dirty, setDirty] = useState(false);
   const [selectedType, setSelectedType] = useState<BlockType>("requireController");
   const [errors, setErrors] = useState<string[]>([]);
@@ -869,6 +1034,11 @@ export function ScenarioEditor({ context }: Props) {
   const [rotationPrompt, setRotationPrompt] = useState<RotationPrompt | null>(null);
   const stopReason = useRef("Остановлено оператором");
   const running = status === "running";
+  const displayedScenarios = [...savedScenarios].sort((left, right) =>
+    scenarioSort === "updatedAt"
+      ? right.updatedAt - left.updatedAt
+      : left.name.localeCompare(right.name, "ru", { numeric: true, sensitivity: "base" }),
+  );
   const emergencyStop = async (reason = "Остановлено оператором") => {
     stopReason.current = reason;
     cancelled.current = true;
@@ -899,6 +1069,9 @@ export function ScenarioEditor({ context }: Props) {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(savedScenarios));
   }, [savedScenarios]);
+  useEffect(() => {
+    localStorage.setItem(SERIAL_NUMBER_KEY, serialNumber);
+  }, [serialNumber]);
   useEffect(() => {
     if (!running) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1108,168 +1281,111 @@ export function ScenarioEditor({ context }: Props) {
     stopReason.current = "Остановлено оператором";
     setEntries([]);
     setStatus("running");
+    const startedAt = new Date().toISOString();
+    const reportEntries: RunEntry[] = [];
+    const saveReport = async (result: SavedRunReport["status"]) => {
+      const report: SavedRunReport = {
+        format: "uav-test-station-report",
+        version: 1,
+        id: crypto.randomUUID(),
+        scenarioId,
+        scenarioName: name.trim(),
+        serialNumber: serialNumber.trim() || undefined,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        status: result,
+        entries: reportEntries,
+      };
+      const fileName = `report-${report.finishedAt.replace(/[:.]/g, "-")}-${report.id}.json`;
+      try {
+        await invoke("save_run_report", { fileName, contents: JSON.stringify(report, null, 2) });
+      } catch (error) {
+        console.error("Не удалось сохранить отчёт", error);
+      }
+    };
     const controllerIsArmed = () => latestContext.current.armed === true;
     let integratedCalibrationMessage: string | null = null;
-    let runHasWarnings = false;
+    const telemetryResults = new Map<string, { message?: string; error?: string }>();
+    const precreatedEntries = new Map<string, RunEntry>();
     for (const [blockIndex, block] of blocks.entries()) {
       if (cancelled.current) {
         setStatus("cancelled");
+        await saveReport("cancelled");
         return;
       }
-      setEntries((all) => [
-        ...all,
-        { blockId: block.id, label: blockLabel(block), status: "running", message: "Выполняется…" },
-      ]);
+      const runningEntry =
+        precreatedEntries.get(block.id) ??
+        ({
+          blockId: block.id,
+          label: blockLabel(block),
+          status: "running",
+          message: "Выполняется…",
+        } satisfies RunEntry);
+      if (!precreatedEntries.has(block.id)) {
+        reportEntries.push(runningEntry);
+        setEntries((all) => [...all, runningEntry]);
+      }
       try {
         let message: string;
-        let entryStatus: RunEntry["status"] = "passed";
-        if (block.type === "checkTelemetryAlive") {
+        const entryStatus: RunEntry["status"] = "passed";
+        if (block.type === "checkTelemetrySignal") {
           if (!latestContext.current.controllerConnected)
             throw new Error("Полётный контроллер не подключён");
-          const samples: NonNullable<ScenarioContext["telemetry"]>[] = [];
-          const ammeterSamples: Array<{
-            current?: number;
-            voltage?: number;
-            messageCount?: number;
-          }> = [];
-          const deadline = Date.now() + block.seconds * 1000;
-          while (Date.now() < deadline) {
-            const sample = latestContext.current.telemetry;
-            if (sample) samples.push({ ...sample });
-            if (latestContext.current.ammeterConnected)
-              ammeterSamples.push({
-                current: latestContext.current.ammeterCurrentA,
-                voltage: latestContext.current.ammeterSensorVoltage,
-                messageCount: latestContext.current.ammeterMessageCount,
-              });
-            await new Promise((resolve) => window.setTimeout(resolve, 250));
-            if (cancelled.current) throw new Error("Выполнение отменено оператором");
-          }
-          if (samples.length < 2) throw new Error("Не получены снимки основной телеметрии");
-          const first = samples[0];
-          const last = samples[samples.length - 1];
-          const stale = [
-            ["батарея", first.batteryUpdateCount, last.batteryUpdateCount],
-            ["ASPD", first.airspeedUpdateCount, last.airspeedUpdateCount],
-            ["барометр", first.barometerUpdateCount, last.barometerUpdateCount],
-            ["IMU", first.imuUpdateCount, last.imuUpdateCount],
-            ["RC input", first.rcUpdateCount, last.rcUpdateCount],
-          ].filter(([, start, end]) => end === start);
-          if (stale.length)
-            throw new Error(
-              `Не обновляются группы телеметрии: ${stale.map(([label]) => label).join(", ")}`,
+          if (!telemetryResults.has(block.id)) {
+            const batch: TelemetryCheckBlock[] = [];
+            for (let index = blockIndex; index < blocks.length; index += 1) {
+              const candidate = blocks[index];
+              if (candidate.type !== "checkTelemetrySignal") break;
+              batch.push(candidate);
+            }
+            const additionalEntries = batch.slice(1).map((candidate) => {
+              const entry: RunEntry = {
+                blockId: candidate.id,
+                label: blockLabel(candidate),
+                status: "running",
+                message: "Параллельный замер…",
+              };
+              precreatedEntries.set(candidate.id, entry);
+              reportEntries.push(entry);
+              return entry;
+            });
+            if (additionalEntries.length) setEntries((all) => [...all, ...additionalEntries]);
+            const maximumDuration = Math.max(
+              ...batch.map((candidate) => candidate.durationSeconds),
             );
-          const required = [
-            ["напряжение батареи", last.batteryVoltageV],
-            ["текущий ток", last.batteryCurrentA],
-            ["заряд батареи", last.batteryRemainingPercent],
-            ["ASPD", last.airspeedMps],
-            ["барометр", last.barometerPressureHpa],
-            ["температура барометра", last.barometerTemperatureC],
-            ["акселерометр X", last.accelerometerXMg],
-            ["акселерометр Y", last.accelerometerYMg],
-            ["акселерометр Z", last.accelerometerZMg],
-            ["курс компаса", last.compassHeadingDeg],
-          ] as const;
-          const missing = required.filter(
-            ([, value]) => value === undefined || !Number.isFinite(value),
-          );
-          if (missing.length)
-            throw new Error(`Нет корректных данных: ${missing.map(([label]) => label).join(", ")}`);
-          if (last.armed === undefined) throw new Error("Нет данных ARM/DISARM");
-          const rcCount = Math.min(last.rcChannelCount ?? 0, last.rcChannels?.length ?? 0, 18);
-          if (!rcCount) throw new Error("Нет данных RC input");
-          const rcValues = last.rcChannels!.slice(0, rcCount);
-          if (rcValues.some((value) => !Number.isFinite(value) || value === 0xffff))
-            throw new Error("В RC input есть отсутствующие или некорректные каналы");
-          const ammeterFirst = ammeterSamples[0];
-          const ammeterLast = ammeterSamples[ammeterSamples.length - 1];
-          if (latestContext.current.ammeterConnected) {
-            if (
-              !ammeterFirst ||
-              !ammeterLast ||
-              ammeterLast.current === undefined ||
-              !Number.isFinite(ammeterLast.current) ||
-              ammeterLast.voltage === undefined ||
-              !Number.isFinite(ammeterLast.voltage)
-            )
-              throw new Error("Нет корректных данных внешнего амперметра");
-            if (ammeterFirst.messageCount === ammeterLast.messageCount)
-              throw new Error("Не обновляются данные внешнего амперметра");
+            const batchStartedAt = Date.now();
+            const samples: TimedTelemetrySample[] = [];
+            while (Date.now() - batchStartedAt < maximumDuration * 1000) {
+              const sample = latestContext.current.telemetry;
+              if (sample)
+                samples.push({ elapsedMs: Date.now() - batchStartedAt, telemetry: { ...sample } });
+              await new Promise((resolve) => window.setTimeout(resolve, 250));
+              if (cancelled.current) throw new Error("Выполнение отменено оператором");
+            }
+            for (const candidate of batch) {
+              try {
+                telemetryResults.set(candidate.id, {
+                  message: evaluateTelemetryCheck(candidate, samples),
+                });
+              } catch (error) {
+                telemetryResults.set(candidate.id, {
+                  error: String(error).replace(/^Error: /, ""),
+                });
+              }
+            }
+            for (const candidate of batch) {
+              const result = telemetryResults.get(candidate.id)!;
+              const status = result.error ? "failed" : "passed";
+              const resultMessage = result.error ?? result.message!;
+              const entry =
+                candidate.id === block.id ? runningEntry : precreatedEntries.get(candidate.id)!;
+              Object.assign(entry, { status, message: resultMessage });
+              updateEntry(candidate.id, { status, message: resultMessage });
+            }
           }
-          const range = (values: Array<number | undefined>) => {
-            const finite = values.filter(
-              (value): value is number => value !== undefined && Number.isFinite(value),
-            );
-            return finite.length ? Math.max(...finite) - Math.min(...finite) : 0;
-          };
-          const batteryVoltageRange = range(samples.map((sample) => sample.batteryVoltageV));
-          const batteryCurrentRange = range(samples.map((sample) => sample.batteryCurrentA));
-          const airspeedRange = range(samples.map((sample) => sample.airspeedMps));
-          const pressureRange = range(samples.map((sample) => sample.barometerPressureHpa));
-          const accelerometerXRange = range(samples.map((sample) => sample.accelerometerXMg));
-          const accelerometerYRange = range(samples.map((sample) => sample.accelerometerYMg));
-          const accelerometerZRange = range(samples.map((sample) => sample.accelerometerZMg));
-          const headingRange = range(samples.map((sample) => sample.compassHeadingDeg));
-          const groupChanges = {
-            battery: batteryVoltageRange >= 0.001 || batteryCurrentRange >= 0.01,
-            airspeed: airspeedRange >= 0.01,
-            barometer: pressureRange >= 0.01,
-            imu:
-              accelerometerXRange >= 1 ||
-              accelerometerYRange >= 1 ||
-              accelerometerZRange >= 1 ||
-              headingRange >= 1,
-          };
-          const changing = Object.values(groupChanges).filter(Boolean).length;
-          const state = (changed: boolean) => (changed ? "ИЗМЕНЯЕТСЯ" : "СТАБИЛЬНО");
-          const report = [
-            `Проверено за ${block.seconds} с (${samples.length} снимков):`,
-            `Контроллер — ${last.armed ? "ARMED" : "DISARMED"}`,
-            `Батарея — ${state(groupChanges.battery)}, обновлений: ${last.batteryUpdateCount - first.batteryUpdateCount}`,
-            `  Напряжение: ${last.batteryVoltageV!.toFixed(3)} V; разброс: ${batteryVoltageRange.toFixed(3)} V`,
-            `  Ток: ${last.batteryCurrentA!.toFixed(3)} A; разброс: ${batteryCurrentRange.toFixed(3)} A`,
-            `  Заряд: ${last.batteryRemainingPercent}%`,
-            `ASPD — ${state(groupChanges.airspeed)}, обновлений: ${last.airspeedUpdateCount - first.airspeedUpdateCount}`,
-            `  Значение: ${last.airspeedMps!.toFixed(3)} m/s; разброс: ${airspeedRange.toFixed(3)} m/s`,
-            `Барометр — ${state(groupChanges.barometer)}, обновлений: ${last.barometerUpdateCount - first.barometerUpdateCount}`,
-            `  Давление: ${last.barometerPressureHpa!.toFixed(2)} hPa; разброс: ${pressureRange.toFixed(2)} hPa`,
-            `  Температура: ${last.barometerTemperatureC!.toFixed(1)} °C`,
-            `IMU — ${state(groupChanges.imu)}, обновлений: ${last.imuUpdateCount - first.imuUpdateCount}`,
-            `  Акселерометр: X=${last.accelerometerXMg} mg (разброс ${accelerometerXRange.toFixed(0)}), Y=${last.accelerometerYMg} mg (разброс ${accelerometerYRange.toFixed(0)}), Z=${last.accelerometerZMg} mg (разброс ${accelerometerZRange.toFixed(0)})`,
-            `  Курс компаса: ${last.compassHeadingDeg}°; разброс: ${headingRange.toFixed(0)}°`,
-            `RC input — обновлений: ${last.rcUpdateCount - first.rcUpdateCount}; каналов: ${rcCount}`,
-            `  ${rcValues.map((value, index) => `CH${index + 1}=${value}`).join(", ")}`,
-            ...(latestContext.current.ammeterConnected
-              ? [
-                  `Внешний амперметр — обновлений: ${(ammeterLast!.messageCount ?? 0) - (ammeterFirst!.messageCount ?? 0)}`,
-                  `  Эталонный ток: ${ammeterLast!.current!.toFixed(3)} A; напряжение датчика: ${ammeterLast!.voltage!.toFixed(3)} V`,
-                ]
-              : ["Внешний амперметр — не подключён, на экране не отображается"]),
-            `Итог: изменяются ${changing} из 4 групп (требуется минимум ${block.minimumChangingGroups}).`,
-          ].join("\n");
-          if (changing < block.minimumChangingGroups)
-            throw new Error(`Недостаточно живых показаний.\n${report}`);
-          const zeroValues: string[] = required
-            .filter(([, value]) => value === 0)
-            .map(([label]) => label);
-          rcValues.forEach((value, index) => {
-            if (value === 0) zeroValues.push(`RC CH${index + 1}`);
-          });
-          if (latestContext.current.ammeterConnected) {
-            if (ammeterLast!.current === 0) zeroValues.push("эталонный ток");
-            if (ammeterLast!.voltage === 0) zeroValues.push("напряжение внешнего датчика");
-          }
-          if (zeroValues.length) {
-            entryStatus = "warning";
-            runHasWarnings = true;
-            message = `ВНИМАНИЕ! НУЛЕВЫЕ ПОКАЗАНИЯ: ${zeroValues.join(", ")}.
-ОПЕРАТОР ДОЛЖЕН УТОЧНИТЬ ДАННЫЕ.
-
-${report}`;
-          } else {
-            message = report;
-          }
+          const result = telemetryResults.get(block.id);
+          if (result?.error) throw new Error(result.error);
+          message = result?.message ?? "Проверка телеметрии не выполнена";
         } else if (block.type === "wait") {
           const deadline = Date.now() + block.seconds * 1000;
           while (Date.now() < deadline) {
@@ -1460,6 +1576,126 @@ ${report}`;
               `Ток покоя ${current.ammeterCurrentA.toFixed(2)} A превышает ${block.maximumIdleCurrentA} A`,
             );
           message = `Контроллер и амперметр готовы, ток покоя ${current.ammeterCurrentA.toFixed(2)} A`;
+        } else if (block.type === "limitMaximumCurrent") {
+          const parameterName = block.parameterName.trim().toUpperCase();
+          let parameter = await invoke<FreshParameter>("read_flight_controller_parameter", {
+            name: parameterName,
+          });
+          const originalParameterValue = parameter.value;
+          const cycleResults: string[] = [];
+          let cycle = 0;
+          let continueTuning = true;
+          while (continueTuning) {
+            cycle += 1;
+            for (let tone = 0; tone < 3; tone += 1) {
+              await playComputerTone();
+              if (tone < 2) await new Promise((resolve) => window.setTimeout(resolve, 500));
+              if (cancelled.current) throw new Error(stopReason.current);
+            }
+            if (latestContext.current.armed !== true) {
+              await invoke("set_flight_controller_armed", { armed: true, force: true });
+              const armDeadline = Date.now() + 5000;
+              while (!controllerIsArmed() && Date.now() < armDeadline) {
+                await new Promise((resolve) => window.setTimeout(resolve, 100));
+                if (cancelled.current) throw new Error(stopReason.current);
+              }
+              if (!controllerIsArmed()) throw new Error("ARM не подтверждён перед измерением");
+            }
+
+            motorActive.current = true;
+            activeEmergencyCurrentA.current = block.emergencyCurrentA;
+            const stepDuration = block.rampDurationSeconds / 3;
+            try {
+              for (const throttlePercent of [33, 66]) {
+                await invoke<MotorRotationCommand>("start_motor_rotation", {
+                  throttlePercent,
+                  durationSeconds: stepDuration + 0.25,
+                });
+                await new Promise((resolve) => window.setTimeout(resolve, stepDuration * 1000));
+                if (cancelled.current) throw new Error(stopReason.current);
+              }
+              const fullCommand = await invoke<MotorRotationCommand>("start_motor_rotation", {
+                throttlePercent: 100,
+                durationSeconds: block.peakHoldSeconds + 0.5,
+              });
+              const startedAt = Date.now();
+              const deadline = startedAt + block.peakHoldSeconds * 1000;
+              const samples: number[] = [];
+              let maximumServo1: number | undefined;
+              while (Date.now() < deadline) {
+                await new Promise((resolve) => window.setTimeout(resolve, 25));
+                if (cancelled.current) throw new Error(stopReason.current);
+                const servo1 = latestContext.current.servo1OutputPwm;
+                if (servo1 !== undefined) maximumServo1 = Math.max(maximumServo1 ?? servo1, servo1);
+                const currentA = latestContext.current.ammeterCurrentA;
+                if (
+                  currentA !== undefined &&
+                  Number.isFinite(currentA) &&
+                  servo1 !== undefined &&
+                  servo1 >= fullCommand.expectedServo1Pwm - 40
+                )
+                  samples.push(Math.abs(currentA));
+                updateEntry(block.id, {
+                  message: `Цикл ${cycle}: плавный набор завершён, 100% газа; CA ${currentA?.toFixed(2) ?? "—"} A`,
+                });
+              }
+              if (maximumServo1 === undefined || maximumServo1 < fullCommand.expectedServo1Pwm - 40)
+                throw new Error("Выход двигателя не достиг полного газа");
+              if (!samples.length) throw new Error("Нет данных амперметра на полном газе");
+              const peakCurrentA = Math.max(...samples);
+              const averageCurrentA =
+                samples.reduce((sum, value) => sum + value, 0) / samples.length;
+              await invoke("emergency_stop_motor");
+              motorActive.current = false;
+              activeEmergencyCurrentA.current = null;
+              const lowerBound = block.targetCurrentA - block.toleranceA;
+              const upperBound = block.targetCurrentA + block.toleranceA;
+              const withinTarget = peakCurrentA >= lowerBound && peakCurrentA <= upperBound;
+              const cycleMessage = `Цикл ${cycle}: CA средний ${averageCurrentA.toFixed(2)} A, пик ${peakCurrentA.toFixed(2)} A; цель ${block.targetCurrentA} ± ${block.toleranceA} A; ${parameterName}=${parameter.value.toFixed(2)}`;
+              cycleResults.push(cycleMessage);
+              const shouldContinue = await confirm(
+                `${cycleMessage}\n\n${withinTarget ? "Целевой диапазон достигнут." : "Требуется корректировка."}\nПродолжить настройку и выполнить следующий цикл?`,
+                {
+                  title: "Ограничение максимального тока",
+                  kind: withinTarget ? "info" : "warning",
+                },
+              );
+              if (!shouldContinue) {
+                continueTuning = false;
+                continue;
+              }
+              const rawRatio = block.targetCurrentA / peakCurrentA;
+              const safeRatio = Math.min(1.1, Math.max(0.9, rawRatio));
+              const requestedValue = parameter.value * safeRatio;
+              await invoke("write_flight_controller_parameters", {
+                requests: [{ name: parameterName, value: requestedValue }],
+              });
+              await new Promise((resolve) => window.setTimeout(resolve, 1000));
+              parameter = await invoke<FreshParameter>("read_flight_controller_parameter", {
+                name: parameterName,
+              });
+              if (
+                Math.abs(parameter.value - requestedValue) >
+                Math.max(0.01, Math.abs(requestedValue) * 0.005)
+              )
+                throw new Error(`Запись ${parameterName} не подтверждена`);
+              cycleResults.push(
+                `${parameterName}: ${(requestedValue / safeRatio).toFixed(2)} → ${parameter.value.toFixed(2)} (коэффициент ${safeRatio.toFixed(3)})`,
+              );
+              const pauseDeadline = Date.now() + block.cooldownSeconds * 1000;
+              while (Date.now() < pauseDeadline) {
+                await new Promise((resolve) => window.setTimeout(resolve, 100));
+                if (cancelled.current) throw new Error(stopReason.current);
+              }
+            } finally {
+              if (motorActive.current) {
+                await invoke("emergency_stop_motor");
+                motorActive.current = false;
+                activeEmergencyCurrentA.current = null;
+              }
+            }
+          }
+          message = `Исходный ${parameterName}=${originalParameterValue.toFixed(2)}. ${cycleResults.join(" | ")}`;
         } else if (block.type === "findCurrentLoad") {
           const followingBlock = blocks[blockIndex + 1];
           const calibrationBlock =
@@ -1832,6 +2068,7 @@ ${report}`;
           );
         } else message = evaluateImmediateBlock(block, latestContext.current);
         updateEntry(block.id, { status: entryStatus, message });
+        Object.assign(runningEntry, { status: entryStatus, message });
       } catch (error) {
         if (motorActive.current) {
           try {
@@ -1842,11 +2079,19 @@ ${report}`;
           }
         }
         updateEntry(block.id, { status: "failed", message: String(error).replace(/^Error: /, "") });
-        setStatus(cancelled.current ? "cancelled" : "failed");
+        const result = cancelled.current ? "cancelled" : "failed";
+        Object.assign(runningEntry, {
+          status: "failed",
+          message: String(error).replace(/^Error: /, ""),
+        });
+        setStatus(result);
+        await saveReport(result);
         return;
       }
     }
-    setStatus(runHasWarnings ? "warning" : "passed");
+    const result = "passed";
+    setStatus(result);
+    await saveReport(result);
   };
   const statusText = {
     idle: "Ещё не запускался",
@@ -1866,6 +2111,18 @@ ${report}`;
             <p>Выберите сценарий для редактирования и запуска.</p>
           </div>
           <div class="editor-header-actions">
+            <label>
+              Сортировка
+              <select
+                value={scenarioSort}
+                onChange={(event) =>
+                  setScenarioSort(event.currentTarget.value as "name" | "updatedAt")
+                }
+              >
+                <option value="name">По названию</option>
+                <option value="updatedAt">Сначала изменённые</option>
+              </select>
+            </label>
             <button type="button" onClick={importScenarios}>
               Импорт
             </button>
@@ -1874,8 +2131,19 @@ ${report}`;
             </button>
           </div>
         </section>
+        <section class="scenario-global-settings">
+          <label>
+            <span>Серийный номер устройства</span>
+            <input
+              value={serialNumber}
+              placeholder="Необязательно, например UAV-001"
+              onInput={(event) => setSerialNumber(event.currentTarget.value)}
+            />
+          </label>
+          <p>Будет добавлен в отчёт при запуске любого сценария. Поле можно оставить пустым.</p>
+        </section>
         <section class="scenario-list-page">
-          {savedScenarios.map((scenario) => (
+          {displayedScenarios.map((scenario) => (
             <button type="button" class="scenario-card" onClick={() => selectScenario(scenario)}>
               <div>
                 <strong>{scenario.name}</strong>

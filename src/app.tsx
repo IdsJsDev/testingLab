@@ -13,6 +13,7 @@ import {
   type ParameterWriteStatus,
 } from "./parameter-utils";
 import { ScenarioEditor } from "./scenario-editor";
+import { ReportViewer } from "./report-viewer";
 
 type Tab = {
   id: string;
@@ -400,22 +401,10 @@ export function App() {
   const tabs: Tab[] = [
     { id: "connections", label: "Подключения", available: true },
     {
-      id: "tests",
-      label: "Испытания",
-      available: hasAnyConnection,
-      unavailableReason: "Подключите хотя бы одно устройство",
-    },
-    {
       id: "telemetry",
       label: "Телеметрия",
       available: hasAnyConnection,
       unavailableReason: "Подключите источник телеметрии или измерений",
-    },
-    {
-      id: "control",
-      label: "Управление",
-      available: false,
-      unavailableReason: "Требуется управляющее соединение",
     },
     {
       id: "parameters",
@@ -425,7 +414,7 @@ export function App() {
     },
     { id: "mcp", label: "MCP", available: true },
     { id: "scenarios", label: "Сценарии", available: true },
-    { id: "results", label: "Результаты", available: true },
+    { id: "results", label: "Отчёты", available: true },
   ];
   const normalizedParameterSearch = parameterSearch.trim().toLowerCase();
   const parameterGroups = groupParameters(parameters?.items ?? [], parameterSearch);
@@ -1298,7 +1287,11 @@ export function App() {
           />
         )}
 
-        {!["connections", "telemetry", "parameters", "mcp", "scenarios"].includes(activeTab) && (
+        {activeTab === "results" && <ReportViewer />}
+
+        {!["connections", "telemetry", "parameters", "mcp", "scenarios", "results"].includes(
+          activeTab,
+        ) && (
           <section class="hero">
             <p class="eyebrow">Следующий этап</p>
             <h1>{tabs.find((tab) => tab.id === activeTab)?.label}</h1>

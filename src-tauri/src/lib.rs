@@ -3,6 +3,7 @@ mod flight_controller;
 mod mcp_server;
 pub mod motor_test;
 mod parameter_file;
+mod reports;
 mod status;
 
 use std::sync::Arc;
@@ -104,6 +105,26 @@ fn load_scenario_file(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn save_run_report(app: AppHandle, file_name: String, contents: String) -> Result<(), String> {
+    reports::save(&app, &file_name, &contents)
+}
+
+#[tauri::command]
+fn list_run_reports(app: AppHandle) -> Result<Vec<String>, String> {
+    reports::list(&app)
+}
+
+#[tauri::command]
+fn load_run_report(app: AppHandle, file_name: String) -> Result<String, String> {
+    reports::load(&app, &file_name)
+}
+
+#[tauri::command]
+fn delete_run_report(app: AppHandle, file_name: String) -> Result<(), String> {
+    reports::delete(&app, &file_name)
+}
+
+#[tauri::command]
 fn write_flight_controller_parameters(
     manager: State<'_, Arc<ControllerManager>>,
     requests: Vec<ParameterWriteRequest>,
@@ -130,8 +151,8 @@ fn start_motor_rotation_inner(
     throttle_percent: f32,
     duration_seconds: f32,
 ) -> Result<MotorRotationCommand, String> {
-    if !throttle_percent.is_finite() || !(1.0..=70.0).contains(&throttle_percent) {
-        return Err("Для моторного запуска разрешён газ от 1 до 70% диапазона RC".to_owned());
+    if !throttle_percent.is_finite() || !(1.0..=100.0).contains(&throttle_percent) {
+        return Err("Для моторного запуска разрешён газ от 1 до 100% диапазона RC".to_owned());
     }
     if !duration_seconds.is_finite() || !(0.1..=5.0).contains(&duration_seconds) {
         return Err("Проверка вращения должна длиться от 0.1 до 5 секунд".to_owned());
@@ -264,6 +285,10 @@ pub fn run() {
             load_mission_planner_parameter_file,
             save_scenario_file,
             load_scenario_file,
+            save_run_report,
+            list_run_reports,
+            load_run_report,
+            delete_run_report,
             write_flight_controller_parameters,
             start_motor_rotation,
             emergency_stop_motor,

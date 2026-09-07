@@ -36,6 +36,27 @@ describe("scenario validation", () => {
     ).toEqual(["Блок 1: число звуков должно быть от 1 до 20"]);
   });
 
+  it("validates an individual telemetry signal check", () => {
+    const block = {
+      id: "telemetry",
+      type: "checkTelemetrySignal" as const,
+      signal: "batteryVoltageV" as const,
+      durationSeconds: 3,
+      minimum: 18,
+      maximum: 26,
+      requireUpdates: true,
+      behavior: "changing" as const,
+      variation: 0.01,
+    };
+    expect(validateScenario("Telemetry", [block])).toEqual([]);
+    expect(validateScenario("Telemetry", [{ ...block, minimum: 30 }])).toContain(
+      "Блок 1: некорректный допустимый диапазон",
+    );
+    expect(validateScenario("Telemetry", [{ ...block, variation: -1 }])).toContain(
+      "Блок 1: изменение должно быть неотрицательным числом",
+    );
+  });
+
   it("accepts motor rotation duration only in half-second steps", () => {
     const rotation = (durationSeconds: number) => ({
       id: "rotation",
@@ -68,6 +89,24 @@ describe("scenario validation", () => {
     expect(validateScenario("Find load", [block])).toEqual([]);
     expect(validateScenario("Find load", [{ ...block, emergencyCurrentA: 20 }])).toContain(
       "Блок 1: аварийный ток должен быть выше целевого диапазона",
+    );
+  });
+
+  it("validates the maximum-current limiting cycle", () => {
+    const block = {
+      id: "maximum-current",
+      type: "limitMaximumCurrent" as const,
+      parameterName: "RC1_MAX",
+      targetCurrentA: 160,
+      toleranceA: 3,
+      emergencyCurrentA: 250,
+      rampDurationSeconds: 0.75,
+      peakHoldSeconds: 0.5,
+      cooldownSeconds: 5,
+    };
+    expect(validateScenario("Maximum current", [block])).toEqual([]);
+    expect(validateScenario("Maximum current", [{ ...block, rampDurationSeconds: 1.5 }])).toContain(
+      "Блок 1: плавный набор должен длиться от 0,5 до 1 секунды",
     );
   });
 });
