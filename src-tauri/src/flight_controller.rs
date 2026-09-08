@@ -157,6 +157,7 @@ pub struct TelemetrySnapshot {
     pub rc_channel_count: Option<u8>,
     pub rc_rssi: Option<u8>,
     pub servo1_output_pwm: Option<u16>,
+    pub servo_output_pwms: Option<[u16; 8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -217,6 +218,10 @@ enum WorkerCommand {
     SetArmed {
         armed: bool,
         force: bool,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    SetFlightMode {
+        custom_mode: u32,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
 }
@@ -481,6 +486,20 @@ impl ControllerManager {
             .recv_timeout(Duration::from_secs(1))
             .map_err(|_| "Контроллер не подтвердил отправку команды ARM/DISARM".to_owned())?
     }
+
+    pub fn set_flight_mode(&self, custom_mode: u32) -> Result<(), String> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.session
+            .lock()
+            .as_ref()
+            .ok_or_else(|| "Полётный контроллер не подключён".to_owned())?
+            .commands
+            .send(WorkerCommand::SetFlightMode { custom_mode, reply })
+            .map_err(|_| "Сессия контроллера уже завершена".to_owned())?;
+        response
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| "Контроллер не подтвердил отправку команды смены режима".to_owned())?
+    }
 }
 
 pub fn list_serial_ports() -> Result<Vec<SerialPortDescriptor>, String> {
@@ -708,6 +727,14 @@ fn run_session(
                                 force,
                                 &mut outbound_sequence,
                             )
+                        });
+                    let _ = reply.send(result);
+                }
+                WorkerCommand::SetFlightMode { custom_mode, reply } => {
+                    let result = target
+                        .ok_or_else(|| "Целевой контроллер ещё не определён".to_owned())
+                        .and_then(|target| {
+                            send_set_mode(&mut writer, target, custom_mode, &mut outbound_sequence)
                         });
                     let _ = reply.send(result);
                 }
@@ -1244,6 +1271,36 @@ fn send_arm_disarm(
     Ok(())
 }
 
+fn send_set_mode(
+    writer: &mut Box<dyn serialport::SerialPort>,
+    target: (u8, u8),
+    custom_mode: u32,
+    sequence: &mut u8,
+) -> Result<(), String> {
+    let message = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        param1: 1.0,
+        param2: custom_mode as f32,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+        command: MavCmd::MAV_CMD_DO_SET_MODE,
+        target_system: target.0,
+        target_component: target.1,
+        confirmation: 0,
+    });
+    let header = MavHeader {
+        system_id: 255,
+        component_id: 190,
+        sequence: *sequence,
+    };
+    mavlink::write_v2_msg(writer, header, &message)
+        .map_err(|error| format!("Не удалось отправить команду смены режима: {error}"))?;
+    *sequence = sequence.wrapping_add(1);
+    Ok(())
+}
+
 fn stop_rc_override(
     writer: &mut Box<dyn serialport::SerialPort>,
     target: Option<(u8, u8)>,
@@ -1324,6 +1381,16 @@ fn update_telemetry(snapshot: &mut TelemetrySnapshot, message: &MavMessage) {
         }
         MavMessage::SERVO_OUTPUT_RAW(data) => {
             snapshot.servo1_output_pwm = Some(data.servo1_raw);
+            snapshot.servo_output_pwms = Some([
+                data.servo1_raw,
+                data.servo2_raw,
+                data.servo3_raw,
+                data.servo4_raw,
+                data.servo5_raw,
+                data.servo6_raw,
+                data.servo7_raw,
+                data.servo8_raw,
+            ]);
         }
         MavMessage::GPS_RAW_INT(data) => {
             snapshot.gps_fix = Some(format!("{:?}", data.fix_type));

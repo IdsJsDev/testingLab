@@ -1,10 +1,13 @@
 export type ScenarioContext = {
   controllerConnected: boolean;
   controllerName?: string;
+  vehicleType?: string;
   armed?: boolean;
+  customMode?: number;
   controllerStatusText?: string;
   rcChannels?: number[];
   servo1OutputPwm?: number;
+  servoOutputPwms?: number[];
   controllerCurrentA?: number;
   telemetry?: {
     batteryVoltageV?: number;

@@ -36,6 +36,7 @@ type MotorRotationCommand = {
   throttleChannel: number;
   inputPwm: number;
   minimumInputPwm: number;
+  motorOutput: number;
   expectedServo1Pwm: number;
 };
 type RotationDecision = "correct" | "incorrect" | "notRotating" | "cancelled";
@@ -44,7 +45,8 @@ type RotationPrompt = {
   throttlePercent: number;
   rcChannel: number;
   inputPwm: number;
-  servo1Pwm: number;
+  motorOutput: number;
+  servoOutputPwm: number;
   averageCurrentA?: number;
   peakCurrentA?: number;
   averageControllerCurrentA?: number;
@@ -1304,12 +1306,84 @@ export function ScenarioEditor({ context }: Props) {
       }
     };
     const controllerIsArmed = () => latestContext.current.armed === true;
+    const originalMotorAccessParameters = new Map<string, number>();
+    let originalFixedWingMode: number | null = null;
+    const waitFor = async (milliseconds: number) => {
+      const deadline = Date.now() + milliseconds;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) =>
+          window.setTimeout(resolve, Math.min(100, deadline - Date.now())),
+        );
+        if (cancelled.current) throw new Error(stopReason.current);
+      }
+    };
+    const configureFixedWingMotorAccess = async () => {
+      if (latestContext.current.vehicleType !== "MAV_TYPE_FIXED_WING") return "";
+      const rcOptions = await invoke<FreshParameter>("read_flight_controller_parameter", {
+        name: "RC_OPTIONS",
+      });
+      const gcsSystemId = await invoke<FreshParameter>("read_flight_controller_parameter", {
+        name: "MAV_GCS_SYSID",
+      });
+      const requestedRcOptions = Math.trunc(rcOptions.value) & ~2;
+      const requests: Array<{ name: string; value: number }> = [];
+      if (requestedRcOptions !== rcOptions.value) {
+        originalMotorAccessParameters.set("RC_OPTIONS", rcOptions.value);
+        requests.push({ name: "RC_OPTIONS", value: requestedRcOptions });
+      }
+      if (Math.round(gcsSystemId.value) !== 255) {
+        originalMotorAccessParameters.set("MAV_GCS_SYSID", gcsSystemId.value);
+        requests.push({ name: "MAV_GCS_SYSID", value: 255 });
+      }
+      if (requests.length) {
+        await invoke("write_flight_controller_parameters", { requests });
+        await waitFor(1000);
+        for (const request of requests) {
+          const confirmed = await invoke<FreshParameter>("read_flight_controller_parameter", {
+            name: request.name,
+          });
+          if (Math.abs(confirmed.value - request.value) > 0.5)
+            throw new Error(
+              `Не удалось подготовить ${request.name}: ожидалось ${request.value}, получено ${confirmed.value}`,
+            );
+        }
+      }
+      if (latestContext.current.customMode !== 0) {
+        originalFixedWingMode ??= latestContext.current.customMode ?? null;
+        await invoke("set_flight_controller_mode", { customMode: 0 });
+        const deadline = Date.now() + 3000;
+        while (latestContext.current.customMode !== 0 && Date.now() < deadline) {
+          await new Promise((resolve) => window.setTimeout(resolve, 100));
+          if (cancelled.current) throw new Error(stopReason.current);
+        }
+        if (latestContext.current.customMode !== 0)
+          throw new Error("Контроллер не подтвердил переход в режим MANUAL");
+      }
+      const changes = requests.map((request) => `${request.name}=${request.value}`).join(", ");
+      return ` Fixed-wing подготовлен: MANUAL${changes ? `; временно установлено ${changes}` : ""}.`;
+    };
+    const restoreMotorAccess = async () => {
+      if (originalMotorAccessParameters.size) {
+        const requests = [...originalMotorAccessParameters].map(([name, value]) => ({
+          name,
+          value,
+        }));
+        await invoke("write_flight_controller_parameters", { requests });
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        originalMotorAccessParameters.clear();
+      }
+      if (originalFixedWingMode !== null) {
+        await invoke("set_flight_controller_mode", { customMode: originalFixedWingMode });
+        originalFixedWingMode = null;
+      }
+    };
     let integratedCalibrationMessage: string | null = null;
     const telemetryResults = new Map<string, { message?: string; error?: string }>();
     const precreatedEntries = new Map<string, RunEntry>();
     for (const [blockIndex, block] of blocks.entries()) {
       if (cancelled.current) {
         setStatus("cancelled");
+        await restoreMotorAccess();
         await saveReport("cancelled");
         return;
       }
@@ -1484,7 +1558,7 @@ export function ScenarioEditor({ context }: Props) {
                   Math.abs(observedInputPwm - motorCommand.inputPwm))
             )
               observedInputPwm = input;
-            const output = latestContext.current.servo1OutputPwm;
+            const output = latestContext.current.servoOutputPwms?.[motorCommand.motorOutput - 1];
             if (
               output !== undefined &&
               output > 0 &&
@@ -1511,10 +1585,10 @@ export function ScenarioEditor({ context }: Props) {
               controllerCurrentSamplesA.push(Math.abs(controllerCurrentA));
             if (Date.now() >= nextDiagnosticAt) {
               const elapsedSeconds = (Date.now() - startedAt) / 1000;
-              const sample = `${elapsedSeconds.toFixed(1)}с: ARM=${latestContext.current.armed === true ? "да" : "нет"}, RC${motorCommand.throttleChannel}=${input ?? "—"}, SERVO1=${output ?? "—"}, FCA=${controllerCurrentA?.toFixed(2) ?? "—"} A, CA=${currentA?.toFixed(2) ?? "—"} A`;
+              const sample = `${elapsedSeconds.toFixed(1)}с: ARM=${latestContext.current.armed === true ? "да" : "нет"}, RC${motorCommand.throttleChannel}=${input ?? "—"}, SERVO${motorCommand.motorOutput}=${output ?? "—"}, FCA=${controllerCurrentA?.toFixed(2) ?? "—"} A, CA=${currentA?.toFixed(2) ?? "—"} A`;
               diagnostics.push(sample);
               updateEntry(block.id, {
-                message: `Газ ${block.throttlePercent}%: цель RC${motorCommand.throttleChannel}=${motorCommand.inputPwm}, SERVO1≈${motorCommand.expectedServo1Pwm} мкс. ${sample}`,
+                message: `Газ ${block.throttlePercent}%: цель RC${motorCommand.throttleChannel}=${motorCommand.inputPwm}, SERVO${motorCommand.motorOutput}≈${motorCommand.expectedServo1Pwm} мкс. ${sample}`,
               });
               nextDiagnosticAt += 200;
             }
@@ -1523,19 +1597,17 @@ export function ScenarioEditor({ context }: Props) {
           motorActive.current = false;
           activeEmergencyCurrentA.current = null;
           if (
-            observedInputPwm === undefined ||
-            Math.abs(observedInputPwm - motorCommand.inputPwm) > 25
-          )
-            throw new Error(
-              `Контроллер не применил RC override: отправлено RC${motorCommand.throttleChannel}=${motorCommand.inputPwm} мкс, получено ${observedInputPwm ?? "нет данных"} мкс. Лог: ${diagnostics.join("; ")}`,
-            );
-          if (
             observedServo1Pwm === undefined ||
             observedServo1Pwm < motorCommand.expectedServo1Pwm - 40
           )
             throw new Error(
-              `Выход SERVO1 не достиг команды газа: ожидалось около ${motorCommand.expectedServo1Pwm} мкс, получено ${observedServo1Pwm ?? "нет данных"} мкс. Лог: ${diagnostics.join("; ")}`,
+              `Выход двигателя SERVO${motorCommand.motorOutput} не достиг команды газа: ожидалось около ${motorCommand.expectedServo1Pwm} мкс, получено ${observedServo1Pwm ?? "нет данных"} мкс. Лог: ${diagnostics.join("; ")}`,
             );
+          const rcInputNote =
+            observedInputPwm === undefined ||
+            Math.abs(observedInputPwm - motorCommand.inputPwm) > 25
+              ? ` Вход RC${motorCommand.throttleChannel}=${observedInputPwm ?? "нет данных"} мкс оставлен только для диагностики: он может отражать приёмник, а не MAVLink override.`
+              : "";
           const averageCurrentA = currentSamplesA.length
             ? currentSamplesA.reduce((sum, value) => sum + value, 0) / currentSamplesA.length
             : undefined;
@@ -1551,8 +1623,9 @@ export function ScenarioEditor({ context }: Props) {
             question: block.confirmation,
             throttlePercent: block.throttlePercent,
             rcChannel: motorCommand.throttleChannel,
-            inputPwm: observedInputPwm,
-            servo1Pwm: observedServo1Pwm,
+            inputPwm: motorCommand.inputPwm,
+            motorOutput: motorCommand.motorOutput,
+            servoOutputPwm: observedServo1Pwm,
             averageCurrentA,
             peakCurrentA,
             averageControllerCurrentA,
@@ -1565,7 +1638,7 @@ export function ScenarioEditor({ context }: Props) {
             );
           if (rotationDecision === "notRotating")
             throw new Error(`Двигатель не вращался. Лог: ${diagnostics.join("; ")}`);
-          message = `Вращение подтверждено: газ ${block.throttlePercent}%, ${block.durationSeconds} с; FCA ${averageControllerCurrentA?.toFixed(2) ?? "нет данных"} A (пик ${peakControllerCurrentA?.toFixed(2) ?? "нет данных"} A); CA ${averageCurrentA?.toFixed(2) ?? "нет данных"} A (пик ${peakCurrentA?.toFixed(2) ?? "нет данных"} A)`;
+          message = `Вращение подтверждено: газ ${block.throttlePercent}%, ${block.durationSeconds} с; FCA ${averageControllerCurrentA?.toFixed(2) ?? "нет данных"} A (пик ${peakControllerCurrentA?.toFixed(2) ?? "нет данных"} A); CA ${averageCurrentA?.toFixed(2) ?? "нет данных"} A (пик ${peakCurrentA?.toFixed(2) ?? "нет данных"} A).${rcInputNote}`;
         } else if (block.type === "prepareMotorTest") {
           const current = latestContext.current;
           if (!current.controllerConnected) throw new Error("Полётный контроллер не подключён");
@@ -1575,7 +1648,8 @@ export function ScenarioEditor({ context }: Props) {
             throw new Error(
               `Ток покоя ${current.ammeterCurrentA.toFixed(2)} A превышает ${block.maximumIdleCurrentA} A`,
             );
-          message = `Контроллер и амперметр готовы, ток покоя ${current.ammeterCurrentA.toFixed(2)} A`;
+          const motorAccessMessage = await configureFixedWingMotorAccess();
+          message = `Контроллер и амперметр готовы, ток покоя ${current.ammeterCurrentA.toFixed(2)} A.${motorAccessMessage}`;
         } else if (block.type === "limitMaximumCurrent") {
           const parameterName = block.parameterName.trim().toUpperCase();
           let parameter = await invoke<FreshParameter>("read_flight_controller_parameter", {
@@ -1625,7 +1699,7 @@ export function ScenarioEditor({ context }: Props) {
               while (Date.now() < deadline) {
                 await new Promise((resolve) => window.setTimeout(resolve, 25));
                 if (cancelled.current) throw new Error(stopReason.current);
-                const servo1 = latestContext.current.servo1OutputPwm;
+                const servo1 = latestContext.current.servoOutputPwms?.[fullCommand.motorOutput - 1];
                 if (servo1 !== undefined) maximumServo1 = Math.max(maximumServo1 ?? servo1, servo1);
                 const currentA = latestContext.current.ammeterCurrentA;
                 if (
@@ -1640,7 +1714,9 @@ export function ScenarioEditor({ context }: Props) {
                 });
               }
               if (maximumServo1 === undefined || maximumServo1 < fullCommand.expectedServo1Pwm - 40)
-                throw new Error("Выход двигателя не достиг полного газа");
+                throw new Error(
+                  `Выход двигателя SERVO${fullCommand.motorOutput} не достиг полного газа`,
+                );
               if (!samples.length) throw new Error("Нет данных амперметра на полном газе");
               const peakCurrentA = Math.max(...samples);
               const averageCurrentA =
@@ -1753,7 +1829,7 @@ export function ScenarioEditor({ context }: Props) {
               await new Promise((resolve) => window.setTimeout(resolve, 50));
               const rc = latestContext.current.rcChannels?.[command.throttleChannel - 1];
               lastReportedRc = rc;
-              const servo1 = latestContext.current.servo1OutputPwm;
+              const servo1 = latestContext.current.servoOutputPwms?.[command.motorOutput - 1];
               if (
                 rc !== undefined &&
                 rc >= 800 &&
@@ -1783,15 +1859,15 @@ export function ScenarioEditor({ context }: Props) {
                 nextCurrentLogAt += 100;
               }
               updateEntry(block.id, {
-                message: `Ступень ${throttle}%: RC${command.throttleChannel}=${rc ?? "—"}, SERVO1=${servo1 ?? "—"}, FCA=${latestContext.current.controllerCurrentA?.toFixed(2) ?? "—"} A, CA=${latestContext.current.ammeterCurrentA?.toFixed(2) ?? "—"} A`,
+                message: `Ступень ${throttle}%: RC${command.throttleChannel}=${rc ?? "—"}, SERVO${command.motorOutput}=${servo1 ?? "—"}, FCA=${latestContext.current.controllerCurrentA?.toFixed(2) ?? "—"} A, CA=${latestContext.current.ammeterCurrentA?.toFixed(2) ?? "—"} A`,
               });
               if (cancelled.current)
                 throw new Error(`${stopReason.current}. Все токи: ${currentHistory.join("; ")}`);
             }
-            if (bestRc !== undefined && Math.abs(bestRc - command.inputPwm) > 25)
-              throw new Error(`На ${throttle}% RC override не подтверждён: RC=${bestRc ?? "—"}`);
             if (maxServo1 === undefined || maxServo1 < command.expectedServo1Pwm - 40)
-              throw new Error(`На ${throttle}% SERVO1 не достиг команды: ${maxServo1 ?? "—"} мкс`);
+              throw new Error(
+                `На ${throttle}% SERVO${command.motorOutput} не достиг команды: ${maxServo1 ?? "—"} мкс`,
+              );
             if (!caSamples.length)
               throw new Error(`На ${throttle}% нет свежих данных внешнего амперметра`);
             const average = (values: number[]) =>
@@ -1808,9 +1884,11 @@ export function ScenarioEditor({ context }: Props) {
               caPeak >= block.emergencyCurrentA ? `, одиночный пик CA ${caPeak.toFixed(2)} A` : "";
             const rcReport =
               bestRc !== undefined
-                ? `${bestRc}`
+                ? Math.abs(bestRc - command.inputPwm) > 25
+                  ? `${bestRc} (вход приёмника)`
+                  : `${bestRc}`
                 : `нет телеметрии (последнее ${lastReportedRc ?? "—"})`;
-            const attempt = `${throttle}%: RC${command.throttleChannel}=${rcReport}, SERVO1=${maxServo1}, FCA=${fcaAverage?.toFixed(2) ?? "—"} A (пик ${fcaPeak?.toFixed(2) ?? "—"}), CA=${caAverage.toFixed(2)} A (пик ${caPeak.toFixed(2)})${spikeWarning}`;
+            const attempt = `${throttle}%: RC${command.throttleChannel}=${rcReport}, SERVO${command.motorOutput}=${maxServo1}, FCA=${fcaAverage?.toFixed(2) ?? "—"} A (пик ${fcaPeak?.toFixed(2) ?? "—"}), CA=${caAverage.toFixed(2)} A (пик ${caPeak.toFixed(2)})${spikeWarning}`;
             attemptLogs.push(attempt);
             updateEntry(block.id, { message: attemptLogs.join(" | ") });
             if (
@@ -1915,7 +1993,7 @@ export function ScenarioEditor({ context }: Props) {
           while (Date.now() < holdDeadline) {
             await new Promise((resolve) => window.setTimeout(resolve, 50));
             const elapsedMs = Date.now() - holdStartedAt;
-            const servo1 = latestContext.current.servo1OutputPwm;
+            const servo1 = latestContext.current.servoOutputPwms?.[holdCommand.motorOutput - 1];
             const ca = latestContext.current.ammeterCurrentA;
             const fca = latestContext.current.controllerCurrentA;
             if (
@@ -2084,12 +2162,18 @@ export function ScenarioEditor({ context }: Props) {
           status: "failed",
           message: String(error).replace(/^Error: /, ""),
         });
+        try {
+          await restoreMotorAccess();
+        } catch (restoreError) {
+          console.error("Не удалось восстановить параметры моторного доступа", restoreError);
+        }
         setStatus(result);
         await saveReport(result);
         return;
       }
     }
     const result = "passed";
+    await restoreMotorAccess();
     setStatus(result);
     await saveReport(result);
   };
@@ -2324,7 +2408,8 @@ export function ScenarioEditor({ context }: Props) {
             <h2>{rotationPrompt.question}</h2>
             <p>
               Газ {rotationPrompt.throttlePercent}% · RC{rotationPrompt.rcChannel}=
-              {rotationPrompt.inputPwm} мкс · SERVO1={rotationPrompt.servo1Pwm} мкс
+              {rotationPrompt.inputPwm} мкс · SERVO{rotationPrompt.motorOutput}=
+              {rotationPrompt.servoOutputPwm} мкс
             </p>
             <p>
               FCA: средний {rotationPrompt.averageControllerCurrentA?.toFixed(2) ?? "нет данных"} A

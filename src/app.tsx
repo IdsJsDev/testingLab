@@ -73,6 +73,7 @@ type TelemetrySnapshot = {
   rcChannelCount?: number;
   rcRssi?: number;
   servo1OutputPwm?: number;
+  servoOutputPwms?: number[];
 };
 
 type ControllerEvent =
@@ -1249,10 +1250,13 @@ export function App() {
               controllerName: heartbeat
                 ? `${heartbeat.vehicleType}, ${heartbeat.autopilot}`
                 : undefined,
+              vehicleType: heartbeat?.vehicleType,
               armed: telemetry?.armed,
+              customMode: telemetry?.customMode,
               controllerStatusText: telemetry?.statusText,
               rcChannels: telemetry?.rcChannels,
               servo1OutputPwm: telemetry?.servo1OutputPwm,
+              servoOutputPwms: telemetry?.servoOutputPwms,
               controllerCurrentA: telemetry?.batteryCurrentA,
               telemetry: telemetry
                 ? {

@@ -23,6 +23,7 @@ struct MotorRotationCommand {
     throttle_channel: u8,
     input_pwm: u16,
     minimum_input_pwm: u16,
+    motor_output: u8,
     expected_servo1_pwm: u16,
 }
 
@@ -186,13 +187,23 @@ fn start_motor_rotation_inner(
     }
     let pwm = minimum_pwm
         + (f32::from(maximum_pwm - minimum_pwm) * throttle_percent / 100.0).round() as u16;
-    let servo1_minimum = read_parameter("SERVO1_MIN")?.round() as u16;
-    let servo1_maximum = read_parameter("SERVO1_MAX")?.round() as u16;
-    if servo1_minimum >= servo1_maximum {
-        return Err("Некорректные SERVO1_MIN/SERVO1_MAX".to_owned());
+    let motor_output = (1..=8)
+        .find(|output| {
+            read_parameter(&format!("SERVO{output}_FUNCTION"))
+                .is_ok_and(|value| value.round() as i32 == 70)
+        })
+        .ok_or_else(|| {
+            "Не найден выход двигателя: задайте SERVOx_FUNCTION = 70 (Throttle)".to_owned()
+        })?;
+    let motor_minimum = read_parameter(&format!("SERVO{motor_output}_MIN"))?.round() as u16;
+    let motor_maximum = read_parameter(&format!("SERVO{motor_output}_MAX"))?.round() as u16;
+    if motor_minimum >= motor_maximum {
+        return Err(format!(
+            "Некорректные SERVO{motor_output}_MIN/SERVO{motor_output}_MAX"
+        ));
     }
-    let expected_servo1_pwm = servo1_minimum
-        + (f32::from(servo1_maximum - servo1_minimum) * throttle_percent / 100.0).round() as u16;
+    let expected_servo1_pwm = motor_minimum
+        + (f32::from(motor_maximum - motor_minimum) * throttle_percent / 100.0).round() as u16;
     manager.start_rc_pulse(
         throttle_channel,
         pwm,
@@ -203,6 +214,7 @@ fn start_motor_rotation_inner(
         throttle_channel,
         input_pwm: pwm,
         minimum_input_pwm: minimum_pwm,
+        motor_output,
         expected_servo1_pwm,
     })
 }
@@ -219,6 +231,14 @@ fn set_flight_controller_armed(
     force: bool,
 ) -> Result<(), String> {
     manager.set_armed(armed, force)
+}
+
+#[tauri::command]
+fn set_flight_controller_mode(
+    manager: State<'_, Arc<ControllerManager>>,
+    custom_mode: u32,
+) -> Result<(), String> {
+    manager.set_flight_mode(custom_mode)
 }
 
 #[tauri::command]
@@ -293,6 +313,7 @@ pub fn run() {
             start_motor_rotation,
             emergency_stop_motor,
             set_flight_controller_armed,
+            set_flight_controller_mode,
             connect_ammeter,
             disconnect_ammeter,
             get_mcp_status,
