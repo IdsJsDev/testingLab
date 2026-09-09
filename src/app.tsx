@@ -88,6 +88,8 @@ type AmmeterSnapshot = {
   protocol: string;
   baudRate: number;
   currentAmps: number;
+  peakAmps: number;
+  instantaneousAmps: number;
   sensorVoltage: number;
   messageCount: number;
 };
@@ -669,8 +671,16 @@ export function App() {
                       <dd>{ammeter.protocol}</dd>
                     </div>
                     <div>
-                      <dt>Ток</dt>
+                      <dt>Средний ток</dt>
                       <dd>{ammeter.currentAmps.toFixed(3)} A</dd>
+                    </div>
+                    <div>
+                      <dt>Пиковый ток</dt>
+                      <dd>{ammeter.peakAmps.toFixed(3)} A</dd>
+                    </div>
+                    <div>
+                      <dt>Мгновенный ток</dt>
+                      <dd>{ammeter.instantaneousAmps.toFixed(3)} A</dd>
                     </div>
                     <div>
                       <dt>Напряжение датчика</dt>
@@ -810,7 +820,17 @@ export function App() {
               <Metric label="Акселерометр Z" value={telemetry?.accelerometerZMg} unit="mg" />
               <Metric label="Курс компаса" value={telemetry?.compassHeadingDeg} unit="°" />
               {ammeter && (
-                <Metric label="Эталонный ток" value={ammeter.currentAmps.toFixed(3)} unit="A" />
+                <Metric label="Средний ток" value={ammeter.currentAmps.toFixed(3)} unit="A" />
+              )}
+              {ammeter && (
+                <Metric label="Пиковый ток" value={ammeter.peakAmps.toFixed(3)} unit="A" />
+              )}
+              {ammeter && (
+                <Metric
+                  label="Мгновенный ток"
+                  value={ammeter.instantaneousAmps.toFixed(3)}
+                  unit="A"
+                />
               )}
               {ammeter && (
                 <Metric
@@ -847,7 +867,13 @@ export function App() {
               <h1>Телеметрия</h1>
             </section>
             <section class="telemetry-grid">
-              <Metric label="Эталонный ток" value={ammeter.currentAmps.toFixed(3)} unit="A" />
+              <Metric label="Средний ток" value={ammeter.currentAmps.toFixed(3)} unit="A" />
+              <Metric label="Пиковый ток" value={ammeter.peakAmps.toFixed(3)} unit="A" />
+              <Metric
+                label="Мгновенный ток"
+                value={ammeter.instantaneousAmps.toFixed(3)}
+                unit="A"
+              />
               <Metric
                 label="Напряжение датчика"
                 value={ammeter.sensorVoltage.toFixed(3)}
@@ -1284,6 +1310,8 @@ export function App() {
                 : undefined,
               ammeterConnected: ammeter !== null,
               ammeterCurrentA: ammeter?.currentAmps,
+              ammeterPeakA: ammeter?.peakAmps,
+              ammeterInstantaneousA: ammeter?.instantaneousAmps,
               ammeterSensorVoltage: ammeter?.sensorVoltage,
               ammeterMessageCount: ammeter?.messageCount,
               parameters: parameters?.items ?? [],

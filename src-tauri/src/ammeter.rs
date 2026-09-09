@@ -19,6 +19,8 @@ pub struct AmmeterSnapshot {
     pub protocol: &'static str,
     pub baud_rate: u32,
     pub current_amps: f32,
+    pub peak_amps: f32,
+    pub instantaneous_amps: f32,
     pub sensor_voltage: f32,
     pub message_count: u64,
 }
@@ -65,7 +67,10 @@ impl AmmeterManager {
             }
             Err(_) => {
                 self.disconnect();
-                Err("Амперметр не ответил: ожидались PONG и DATA:<amps>:<volts>".to_owned())
+                Err(
+                    "Амперметр не ответил: ожидались PONG и строка DATA в поддерживаемом формате"
+                        .to_owned(),
+                )
             }
         }
     }
@@ -132,8 +137,11 @@ fn run_session(
                 if line == "PONG" {
                     saw_pong = true;
                 }
-                if let Some((current_amps, sensor_voltage)) = parse_data_line(line) {
-                    first_data = Some((current_amps, sensor_voltage));
+                if let Some((current_amps, peak_amps, instantaneous_amps, sensor_voltage)) =
+                    parse_data_line(line)
+                {
+                    first_data =
+                        Some((current_amps, peak_amps, instantaneous_amps, sensor_voltage));
                     last_data = Instant::now();
                     message_count += 1;
 
@@ -143,6 +151,8 @@ fn run_session(
                             protocol: "ammeter-ascii-v1",
                             baud_rate: BAUD_RATE,
                             current_amps,
+                            peak_amps,
+                            instantaneous_amps,
                             sensor_voltage,
                             message_count,
                         };
@@ -153,13 +163,16 @@ fn run_session(
 
                 if !identified
                     && saw_pong
-                    && let Some((current_amps, sensor_voltage)) = first_data
+                    && let Some((current_amps, peak_amps, instantaneous_amps, sensor_voltage)) =
+                        first_data
                 {
                     let snapshot = AmmeterSnapshot {
                         port_name: port_name.clone(),
                         protocol: "ammeter-ascii-v1",
                         baud_rate: BAUD_RATE,
                         current_amps,
+                        peak_amps,
+                        instantaneous_amps,
                         sensor_voltage,
                         message_count,
                     };
@@ -183,7 +196,7 @@ fn run_session(
 
         if !identified && started_at.elapsed() >= CONNECT_TIMEOUT {
             let _ = identified_tx.send(Err(format!(
-                "Порт {port_name} не соответствует протоколу амперметра: ожидались PONG и DATA:<amps>:<volts> на 9600 бод"
+                "Порт {port_name} не соответствует протоколу амперметра: ожидались PONG и строка DATA в поддерживаемом формате на 9600 бод"
             )));
             return;
         }
@@ -199,17 +212,35 @@ fn run_session(
     }
 }
 
-fn parse_data_line(line: &str) -> Option<(f32, f32)> {
+fn parse_data_line(line: &str) -> Option<(f32, f32, f32, f32)> {
     let mut fields = line.split(':');
     if fields.next()? != "DATA" {
         return None;
     }
-    let amps = fields.next()?.trim().parse::<f32>().ok()?;
-    let volts = fields.next()?.trim().parse::<f32>().ok()?;
-    if fields.next().is_some() || !amps.is_finite() || !volts.is_finite() {
+    let values = fields
+        .map(str::trim)
+        .map(str::parse::<f32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let (average_amps, peak_amps, instantaneous_amps, volts) = match values.as_slice() {
+        // Прежняя прошивка: DATA:<amps>:<volts>
+        [amps, volts] => (*amps, *amps, *amps, *volts),
+        // Первая версия прошивки с пиком: DATA:<average_amps>:<peak_amps>:<volts>
+        [average_amps, peak_amps, volts] => (*average_amps, *peak_amps, *peak_amps, *volts),
+        // Актуальная прошивка: DATA:<average_amps>:<peak_amps>:<instant_amps>:<volts>
+        [average_amps, peak_amps, instantaneous_amps, volts] => {
+            (*average_amps, *peak_amps, *instantaneous_amps, *volts)
+        }
+        _ => return None,
+    };
+    if !average_amps.is_finite()
+        || !peak_amps.is_finite()
+        || !instantaneous_amps.is_finite()
+        || !volts.is_finite()
+    {
         return None;
     }
-    Some((amps, volts))
+    Some((average_amps, peak_amps, instantaneous_amps, volts))
 }
 
 #[cfg(test)]
@@ -221,14 +252,25 @@ mod tests {
 
     #[test]
     fn parses_firmware_data_line() {
-        assert_eq!(parse_data_line("DATA:12.345:0.247"), Some((12.345, 0.247)));
+        assert_eq!(
+            parse_data_line("DATA:12.345:13.500:11.400:0.247"),
+            Some((12.345, 13.5, 11.4, 0.247))
+        );
+        assert_eq!(
+            parse_data_line("DATA:12.345:13.500:0.247"),
+            Some((12.345, 13.5, 13.5, 0.247))
+        );
+        assert_eq!(
+            parse_data_line("DATA:12.345:0.247"),
+            Some((12.345, 12.345, 12.345, 0.247))
+        );
     }
 
     #[test]
     fn rejects_other_serial_protocols() {
         assert_eq!(parse_data_line("HEARTBEAT:1:1"), None);
         assert_eq!(parse_data_line("DATA:broken:0.1"), None);
-        assert_eq!(parse_data_line("DATA:1:2:3"), None);
+        assert_eq!(parse_data_line("DATA:1:2:3:4:5"), None);
     }
 
     #[test]

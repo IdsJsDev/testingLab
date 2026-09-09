@@ -33,6 +33,8 @@ export type ScenarioContext = {
   };
   ammeterConnected: boolean;
   ammeterCurrentA?: number;
+  ammeterPeakA?: number;
+  ammeterInstantaneousA?: number;
   ammeterSensorVoltage?: number;
   ammeterMessageCount?: number;
   parameters: Array<{ name: string; value: number }>;
@@ -196,6 +198,13 @@ export type ScenarioBlock =
       durationSeconds: number;
       settlingSeconds: number;
       emergencyCurrentA: number;
+    }
+  | {
+      id: string;
+      type: "fullThrottleStandRun";
+      throttlePercent: number;
+      rampDurationSeconds: number;
+      durationSeconds: number;
     }
   | {
       id: string;
@@ -391,6 +400,18 @@ export const blockCatalog: BlockDefinition[] = [
     }),
   },
   {
+    type: "fullThrottleStandRun",
+    label: "Резко подать полный газ",
+    description: "Для стенда: подаёт заданный газ сразу или плавно за настроенное время.",
+    create: (id) => ({
+      id,
+      type: "fullThrottleStandRun",
+      throttlePercent: 100,
+      rampDurationSeconds: 1,
+      durationSeconds: 0.5,
+    }),
+  },
+  {
     type: "tuneRcMaxByCurrent",
     label: "Настроить RC1_MAX по току",
     description: "Ограниченно корректирует RC1_MAX до заданного максимального тока.",
@@ -512,6 +533,26 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
       if (block.settlingSeconds < 0 || block.settlingSeconds >= block.durationSeconds)
         errors.push(`${prefix}: некорректное время стабилизации`);
       if (block.emergencyCurrentA <= 0) errors.push(`${prefix}: укажите аварийный ток`);
+    } else if (block.type === "fullThrottleStandRun") {
+      if (
+        !Number.isFinite(block.throttlePercent) ||
+        block.throttlePercent < 1 ||
+        block.throttlePercent > 100
+      )
+        errors.push(`${prefix}: газ должен быть от 1 до 100%`);
+      if (
+        !Number.isFinite(block.rampDurationSeconds) ||
+        block.rampDurationSeconds < 0 ||
+        block.rampDurationSeconds > 5 ||
+        Math.abs(block.rampDurationSeconds * 2 - Math.round(block.rampDurationSeconds * 2)) > 1e-6
+      )
+        errors.push(`${prefix}: время набора должно быть от 0 до 5 секунд с шагом 0,5 секунды`);
+      if (
+        !Number.isFinite(block.durationSeconds) ||
+        block.durationSeconds < 0.1 ||
+        block.durationSeconds > 5
+      )
+        errors.push(`${prefix}: полный газ должен длиться от 0,1 до 5 секунд`);
     } else if (block.type === "findCurrentLoad") {
       if (block.targetCurrentA <= 0 || block.toleranceA < 0)
         errors.push(`${prefix}: некорректная цель или допуск тока`);

@@ -67,7 +67,7 @@ type ScenarioFile = {
 
 const STORAGE_KEY = "uav-test-station.scenarios.v1";
 const SERIAL_NUMBER_KEY = "uav-test-station.device-serial-number.v1";
-const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v25";
+const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v29";
 const motorTestTemplate: SavedScenario = {
   id: "built-in-motor-test-v1",
   name: "04 — Тест двигателя БПЛА",
@@ -212,6 +212,23 @@ const motorTestTemplates: SavedScenario[] = [
         emergencyCurrentA: 35,
       },
       { id: "find-load-5", type: "disarmController" },
+    ],
+  },
+  {
+    id: "built-in-full-throttle-stand-v1",
+    name: "05 — Резкий полный газ (стенд)",
+    updatedAt: Date.now(),
+    blocks: [
+      { id: "full-throttle-1", type: "requireController" },
+      { id: "full-throttle-2", type: "sound", repeats: 3, intervalSeconds: 0.5 },
+      {
+        id: "full-throttle-3",
+        type: "fullThrottleStandRun",
+        throttlePercent: 100,
+        rampDurationSeconds: 1,
+        durationSeconds: 0.5,
+      },
+      { id: "full-throttle-4", type: "disarmController" },
     ],
   },
   motorTestTemplate,
@@ -468,7 +485,7 @@ function Fields({
     );
   if (block.type === "currentInRange")
     return (
-      <div class="block-fields">
+      <div class="block-fields three-fields">
         <label>
           Минимум, A
           <input
@@ -664,6 +681,49 @@ function Fields({
             step="1"
             value={block.emergencyCurrentA}
             onInput={(e) => replace({ ...block, emergencyCurrentA: e.currentTarget.valueAsNumber })}
+          />
+        </label>
+      </div>
+    );
+  if (block.type === "fullThrottleStandRun")
+    return (
+      <div class="block-fields three-fields">
+        <label>
+          Газ, %
+          <input
+            disabled={disabled}
+            type="number"
+            min="1"
+            max="100"
+            step="1"
+            value={block.throttlePercent}
+            onInput={(e) => replace({ ...block, throttlePercent: e.currentTarget.valueAsNumber })}
+          />
+        </label>
+        <label>
+          Набор газа, с
+          <input
+            disabled={disabled}
+            type="number"
+            min="0"
+            max="5"
+            step="0.5"
+            value={block.rampDurationSeconds}
+            onInput={(e) =>
+              replace({ ...block, rampDurationSeconds: e.currentTarget.valueAsNumber })
+            }
+          />
+        </label>
+        <label>
+          Удержание газа, с
+          <input
+            disabled={disabled}
+            type="number"
+            min="0.1"
+            max="5"
+            step="0.1"
+            value={block.durationSeconds}
+            onInput={(e) => replace({ ...block, durationSeconds: e.currentTarget.valueAsNumber })}
           />
         </label>
       </div>
@@ -1086,7 +1146,7 @@ export function ScenarioEditor({ context }: Props) {
   }, [running]);
   useEffect(() => {
     const limit = activeEmergencyCurrentA.current;
-    const currentA = Math.abs(context.ammeterCurrentA ?? 0);
+    const currentA = Math.abs(context.ammeterPeakA ?? context.ammeterCurrentA ?? 0);
     const now = Date.now();
     let currentLimitExceeded = false;
     let currentLimitReason = "";
@@ -1108,7 +1168,9 @@ export function ScenarioEditor({ context }: Props) {
     if (
       running &&
       motorActive.current &&
-      (!context.controllerConnected || !context.ammeterConnected || currentLimitExceeded)
+      (!context.controllerConnected ||
+        (limit !== null && !context.ammeterConnected) ||
+        currentLimitExceeded)
     ) {
       const reason = currentLimitExceeded
         ? currentLimitReason
@@ -1117,7 +1179,13 @@ export function ScenarioEditor({ context }: Props) {
           : "Потеряно соединение с амперметром";
       void emergencyStop(reason);
     }
-  }, [running, context.controllerConnected, context.ammeterConnected, context.ammeterCurrentA]);
+  }, [
+    running,
+    context.controllerConnected,
+    context.ammeterConnected,
+    context.ammeterCurrentA,
+    context.ammeterPeakA,
+  ]);
 
   const changeDraft = () => {
     setDirty(true);
@@ -1529,6 +1597,76 @@ export function ScenarioEditor({ context }: Props) {
               `Контроллер не подтвердил принудительный DISARM по heartbeat; ARM=${latestContext.current.armed === true ? "да" : "неизвестно"}, сообщение=${latestContext.current.controllerStatusText ?? "нет"}`,
             );
           message = "Двигатель остановлен, контроллер подтвердил DISARM";
+        } else if (block.type === "fullThrottleStandRun") {
+          if (!latestContext.current.controllerConnected)
+            throw new Error("Полётный контроллер не подключён");
+
+          const motorAccessMessage = await configureFixedWingMotorAccess();
+          if (latestContext.current.armed !== true) {
+            await invoke("set_flight_controller_armed", { armed: true, force: true });
+            const armDeadline = Date.now() + 5000;
+            while (!controllerIsArmed() && Date.now() < armDeadline) {
+              await new Promise((resolve) => window.setTimeout(resolve, 100));
+              if (cancelled.current) throw new Error(stopReason.current);
+            }
+            if (!controllerIsArmed())
+              throw new Error("ARM не подтверждён перед подачей полного газа");
+          }
+
+          let maximumServoOutput: number | undefined;
+          let motorCommand: MotorRotationCommand | undefined;
+          motorActive.current = true;
+          activeEmergencyCurrentA.current = null;
+          try {
+            if (block.rampDurationSeconds > 0) {
+              // Три крупные ступени повторяют уже проверенный сценарий ограничения тока.
+              // Первые 10–20% часто ниже порога старта двигателя и не должны многократно
+              // перезаписывать RC override до финальной команды газа.
+              const stepCount = 3;
+              const stepDurationSeconds = block.rampDurationSeconds / stepCount;
+              for (let step = 1; step < stepCount; step += 1) {
+                const stepThrottlePercent = Math.max(1, (block.throttlePercent * step) / stepCount);
+                await invoke<MotorRotationCommand>("start_motor_rotation", {
+                  throttlePercent: stepThrottlePercent,
+                  durationSeconds: Math.min(5, stepDurationSeconds + 0.2),
+                });
+                updateEntry(block.id, {
+                  message: `Плавный набор: ${stepThrottlePercent.toFixed(0)}% из ${block.throttlePercent}%`,
+                });
+                await waitFor(stepDurationSeconds * 1000);
+              }
+            }
+            motorCommand = await invoke<MotorRotationCommand>("start_motor_rotation", {
+              throttlePercent: block.throttlePercent,
+              durationSeconds: block.durationSeconds,
+            });
+            const startedAt = Date.now();
+            const deadline = startedAt + block.durationSeconds * 1000;
+            while (Date.now() < deadline) {
+              await new Promise((resolve) => window.setTimeout(resolve, 25));
+              if (cancelled.current) throw new Error(stopReason.current);
+              const servoOutput =
+                latestContext.current.servoOutputPwms?.[motorCommand.motorOutput - 1];
+              if (servoOutput !== undefined)
+                maximumServoOutput = Math.max(maximumServoOutput ?? servoOutput, servoOutput);
+              updateEntry(block.id, { message: `${block.throttlePercent}% газа` });
+            }
+          } finally {
+            await invoke("emergency_stop_motor");
+            motorActive.current = false;
+            activeEmergencyCurrentA.current = null;
+          }
+
+          if (!motorCommand) throw new Error("Не удалось отправить команду полного газа");
+          const servoMessage =
+            maximumServoOutput === undefined
+              ? `выход SERVO${motorCommand.motorOutput} не получен в телеметрии`
+              : `SERVO${motorCommand.motorOutput} достиг ${maximumServoOutput} мкс при цели около ${motorCommand.expectedServo1Pwm} мкс`;
+          const rampMessage =
+            block.rampDurationSeconds > 0
+              ? `с плавным набором за ${block.rampDurationSeconds.toLocaleString("ru-RU")} с`
+              : "резко";
+          message = `Подано ${block.throttlePercent}% газа ${rampMessage}, удержание ${block.durationSeconds.toLocaleString("ru-RU")} с; ${servoMessage}.${motorAccessMessage}`;
         } else if (block.type === "checkMotorRotation") {
           if (latestContext.current.armed !== true)
             throw new Error("Перед запуском двигателя контроллер должен находиться в ARM");
@@ -1694,7 +1832,8 @@ export function ScenarioEditor({ context }: Props) {
               });
               const startedAt = Date.now();
               const deadline = startedAt + block.peakHoldSeconds * 1000;
-              const samples: number[] = [];
+              const averageSamples: number[] = [];
+              const peakSamples: number[] = [];
               let maximumServo1: number | undefined;
               while (Date.now() < deadline) {
                 await new Promise((resolve) => window.setTimeout(resolve, 25));
@@ -1702,25 +1841,30 @@ export function ScenarioEditor({ context }: Props) {
                 const servo1 = latestContext.current.servoOutputPwms?.[fullCommand.motorOutput - 1];
                 if (servo1 !== undefined) maximumServo1 = Math.max(maximumServo1 ?? servo1, servo1);
                 const currentA = latestContext.current.ammeterCurrentA;
+                const peakA = latestContext.current.ammeterPeakA ?? currentA;
                 if (
                   currentA !== undefined &&
+                  peakA !== undefined &&
                   Number.isFinite(currentA) &&
+                  Number.isFinite(peakA) &&
                   servo1 !== undefined &&
                   servo1 >= fullCommand.expectedServo1Pwm - 40
-                )
-                  samples.push(Math.abs(currentA));
+                ) {
+                  averageSamples.push(Math.abs(currentA));
+                  peakSamples.push(Math.abs(peakA));
+                }
                 updateEntry(block.id, {
-                  message: `Цикл ${cycle}: плавный набор завершён, 100% газа; CA ${currentA?.toFixed(2) ?? "—"} A`,
+                  message: `Цикл ${cycle}: плавный набор завершён, 100% газа; CA средний ${currentA?.toFixed(2) ?? "—"} A, пик ${peakA?.toFixed(2) ?? "—"} A`,
                 });
               }
               if (maximumServo1 === undefined || maximumServo1 < fullCommand.expectedServo1Pwm - 40)
                 throw new Error(
                   `Выход двигателя SERVO${fullCommand.motorOutput} не достиг полного газа`,
                 );
-              if (!samples.length) throw new Error("Нет данных амперметра на полном газе");
-              const peakCurrentA = Math.max(...samples);
+              if (!peakSamples.length) throw new Error("Нет данных амперметра на полном газе");
+              const peakCurrentA = Math.max(...peakSamples);
               const averageCurrentA =
-                samples.reduce((sum, value) => sum + value, 0) / samples.length;
+                averageSamples.reduce((sum, value) => sum + value, 0) / averageSamples.length;
               await invoke("emergency_stop_motor");
               motorActive.current = false;
               activeEmergencyCurrentA.current = null;

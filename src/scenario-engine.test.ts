@@ -109,6 +109,26 @@ describe("scenario validation", () => {
       "Блок 1: плавный набор должен длиться от 0,5 до 1 секунды",
     );
   });
+
+  it("validates the full-throttle stand run duration", () => {
+    const block = {
+      id: "full-throttle",
+      type: "fullThrottleStandRun" as const,
+      throttlePercent: 100,
+      rampDurationSeconds: 1,
+      durationSeconds: 0.5,
+    };
+    expect(validateScenario("Stand", [block])).toEqual([]);
+    expect(validateScenario("Stand", [{ ...block, durationSeconds: 0.05 }])).toContain(
+      "Блок 1: полный газ должен длиться от 0,1 до 5 секунд",
+    );
+    expect(validateScenario("Stand", [{ ...block, throttlePercent: 101 }])).toContain(
+      "Блок 1: газ должен быть от 1 до 100%",
+    );
+    expect(validateScenario("Stand", [{ ...block, rampDurationSeconds: 0.3 }])).toContain(
+      "Блок 1: время набора должно быть от 0 до 5 секунд с шагом 0,5 секунды",
+    );
+  });
 });
 
 describe("immediate block evaluation", () => {
