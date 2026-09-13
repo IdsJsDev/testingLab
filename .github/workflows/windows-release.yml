@@ -2,6 +2,8 @@ name: Windows release
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
   push:
     branches:
       - main
@@ -12,8 +14,38 @@ permissions:
   contents: write
 
 jobs:
+  should-build:
+    name: Check whether a release is missing
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+
+    steps:
+      - name: Checkout current main revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Skip scheduled rebuild when this commit is already released
+        id: check
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch --tags --force
+          if git tag --points-at HEAD | grep -q '^windows-v'; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-windows:
     name: Build Windows x64
+    needs: should-build
+    if: needs.should-build.outputs.build == 'true'
     runs-on: windows-latest
 
     steps:
