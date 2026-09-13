@@ -156,7 +156,7 @@ export const telemetrySignalCatalog: Array<{
   },
 ];
 
-export type ScenarioBlock =
+export type ScenarioBlock = (
   | { id: string; type: "requireController" }
   | { id: string; type: "requireAmmeter" }
   | { id: string; type: "requireDisarmed" }
@@ -203,6 +203,9 @@ export type ScenarioBlock =
       id: string;
       type: "fullThrottleStandRun";
       throttlePercent: number;
+      throttleMode: "percent" | "pwm";
+      throttlePwm?: number;
+      saveRcMaxAfterRun: boolean;
       rampDurationSeconds: number;
       durationSeconds: number;
     }
@@ -249,7 +252,8 @@ export type ScenarioBlock =
       comparisonToleranceA: number;
       maximumDurationSeconds: number;
       emergencyCurrentA: number;
-    };
+    }
+) & { disabled?: boolean };
 
 export type BlockType = ScenarioBlock["type"];
 
@@ -407,6 +411,8 @@ export const blockCatalog: BlockDefinition[] = [
       id,
       type: "fullThrottleStandRun",
       throttlePercent: 100,
+      throttleMode: "percent",
+      saveRcMaxAfterRun: false,
       rampDurationSeconds: 1,
       durationSeconds: 0.5,
     }),
@@ -540,6 +546,15 @@ export function validateScenario(name: string, blocks: ScenarioBlock[]): string[
         block.throttlePercent > 100
       )
         errors.push(`${prefix}: газ должен быть от 1 до 100%`);
+      if (block.throttleMode !== "percent" && block.throttleMode !== "pwm")
+        errors.push(`${prefix}: выберите способ задания газа`);
+      if (
+        block.throttleMode === "pwm" &&
+        (!Number.isFinite(block.throttlePwm) ||
+          block.throttlePwm! < 800 ||
+          block.throttlePwm! > 2200)
+      )
+        errors.push(`${prefix}: задайте газ от 800 до 2200 мкс`);
       if (
         !Number.isFinite(block.rampDurationSeconds) ||
         block.rampDurationSeconds < 0 ||

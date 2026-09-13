@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from "preact/hooks";
 type ReportEntry = {
   blockId: string;
   label: string;
-  status: "running" | "passed" | "warning" | "failed";
+  status: "running" | "passed" | "warning" | "failed" | "skipped";
   message: string;
 };
 type RunReport = {
@@ -97,22 +97,24 @@ export function ReportViewer() {
             </button>
           </div>
           {error && <p class="scenario-errors">{error}</p>}
-          {filtered.length ? (
-            filtered.map((item) => (
-              <button
-                type="button"
-                class={`report-item ${selected?.fileName === item.fileName ? "active" : ""}`}
-                onClick={() => setSelected(item)}
-              >
-                <strong>{item.report.scenarioName}</strong>
-                <span>{new Date(item.report.finishedAt).toLocaleString("ru-RU")}</span>
-                <small>{item.report.serialNumber || "Без серийного номера"}</small>
-                <em class={item.report.status}>{statusLabel[item.report.status]}</em>
-              </button>
-            ))
-          ) : (
-            <p class="muted">Отчётов пока нет.</p>
-          )}
+          <div class="report-list-content">
+            {filtered.length ? (
+              filtered.map((item) => (
+                <button
+                  type="button"
+                  class={`report-item ${selected?.fileName === item.fileName ? "active" : ""}`}
+                  onClick={() => setSelected(item)}
+                >
+                  <strong>{item.report.scenarioName}</strong>
+                  <span>{new Date(item.report.finishedAt).toLocaleString("ru-RU")}</span>
+                  <small>{item.report.serialNumber || "Без серийного номера"}</small>
+                  <em class={item.report.status}>{statusLabel[item.report.status]}</em>
+                </button>
+              ))
+            ) : (
+              <p class="muted">Отчётов пока нет.</p>
+            )}
+          </div>
         </aside>
         <article class="report-details">
           {selected ? (
@@ -148,7 +150,13 @@ export function ReportViewer() {
                 {selected.report.entries.map((entry) => (
                   <div class={`run-entry ${entry.status}`}>
                     <span>
-                      {entry.status === "passed" ? "✓" : entry.status === "warning" ? "!" : "×"}
+                      {entry.status === "passed"
+                        ? "✓"
+                        : entry.status === "warning"
+                          ? "!"
+                          : entry.status === "skipped"
+                            ? "—"
+                            : "×"}
                     </span>
                     <div>
                       <strong>{entry.label}</strong>

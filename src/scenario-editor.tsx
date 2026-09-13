@@ -1,4 +1,4 @@
-import { confirm, open, save } from "@tauri-apps/plugin-dialog";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "preact/hooks";
 import {
@@ -12,11 +12,12 @@ import {
   type ScenarioBlock,
   type ScenarioContext,
 } from "./scenario-engine";
+import { UiInput, UiSelect } from "./ui";
 
 type RunEntry = {
   blockId: string;
   label: string;
-  status: "running" | "passed" | "warning" | "failed";
+  status: "running" | "passed" | "warning" | "failed" | "skipped";
   message: string;
 };
 type SavedRunReport = {
@@ -58,16 +59,12 @@ type SavedScenario = {
   name: string;
   blocks: ScenarioBlock[];
   updatedAt: number;
-};
-type ScenarioFile = {
-  format: "uav-test-station-scenarios";
-  version: 1;
-  scenarios: SavedScenario[];
+  archived?: boolean;
 };
 
 const STORAGE_KEY = "uav-test-station.scenarios.v1";
 const SERIAL_NUMBER_KEY = "uav-test-station.device-serial-number.v1";
-const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v29";
+const TEMPLATE_SEEDED_KEY = "uav-test-station.motor-template.v30";
 const motorTestTemplate: SavedScenario = {
   id: "built-in-motor-test-v1",
   name: "04 — Тест двигателя БПЛА",
@@ -225,6 +222,8 @@ const motorTestTemplates: SavedScenario[] = [
         id: "full-throttle-3",
         type: "fullThrottleStandRun",
         throttlePercent: 100,
+        throttleMode: "percent",
+        saveRcMaxAfterRun: false,
         rampDurationSeconds: 1,
         durationSeconds: 0.5,
       },
@@ -237,7 +236,22 @@ const motorTestTemplates: SavedScenario[] = [
 function loadScenarios(): SavedScenario[] {
   try {
     const value = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]") as unknown;
-    const scenarios = Array.isArray(value) ? (value as SavedScenario[]) : [];
+    const scenarios = Array.isArray(value)
+      ? (value as SavedScenario[]).map((scenario) => ({
+          ...scenario,
+          blocks: scenario.blocks.map((block) =>
+            block.type === "fullThrottleStandRun"
+              ? {
+                  ...block,
+                  throttleMode: block.throttleMode ?? "percent",
+                  saveRcMaxAfterRun: block.saveRcMaxAfterRun ?? false,
+                }
+              : block.type === "disarmController"
+                ? { ...block, disabled: false }
+                : block,
+          ),
+        }))
+      : [];
     if (localStorage.getItem(TEMPLATE_SEEDED_KEY) !== "1") {
       localStorage.setItem(TEMPLATE_SEEDED_KEY, "1");
       const updatedBuiltIns = new Map(
@@ -336,10 +350,12 @@ function Fields({
   block,
   replace,
   disabled,
+  context,
 }: {
   block: ScenarioBlock;
   replace: (value: ScenarioBlock) => void;
   disabled: boolean;
+  context: ScenarioContext;
 }) {
   if (block.type === "checkTelemetrySignal") {
     const definition =
@@ -685,21 +701,75 @@ function Fields({
         </label>
       </div>
     );
-  if (block.type === "fullThrottleStandRun")
+  if (block.type === "fullThrottleStandRun") {
+    const throttleChannel = Math.round(
+      context.parameters.find((parameter) => parameter.name === "RCMAP_THROTTLE")?.value ?? 1,
+    );
+    const minimum = context.parameters.find(
+      (parameter) => parameter.name === `RC${throttleChannel}_MIN`,
+    )?.value;
+    const maximum = context.parameters.find(
+      (parameter) => parameter.name === `RC${throttleChannel}_MAX`,
+    )?.value;
+    const hasRange =
+      minimum !== undefined &&
+      maximum !== undefined &&
+      Number.isFinite(minimum) &&
+      Number.isFinite(maximum) &&
+      minimum < maximum;
+    const targetPwm =
+      block.throttleMode === "pwm"
+        ? block.throttlePwm
+        : hasRange
+          ? Math.round(minimum + ((maximum - minimum) * block.throttlePercent) / 100)
+          : undefined;
+    const shownPercent =
+      hasRange && targetPwm !== undefined
+        ? ((targetPwm - minimum) / (maximum - minimum)) * 100
+        : block.throttlePercent;
     return (
       <div class="block-fields three-fields">
         <label>
-          Газ, %
+          Задать газ
+          <select
+            disabled={disabled}
+            value={block.throttleMode}
+            onChange={(e) =>
+              replace({ ...block, throttleMode: e.currentTarget.value as "percent" | "pwm" })
+            }
+          >
+            <option value="percent">Проценты</option>
+            <option value="pwm">Микросекунды</option>
+          </select>
+        </label>
+        <label>
+          {block.throttleMode === "percent" ? "Газ, %" : "Газ, мкс"}
           <input
             disabled={disabled}
             type="number"
-            min="1"
-            max="100"
+            min={block.throttleMode === "percent" ? "1" : "800"}
+            max={block.throttleMode === "percent" ? "100" : "2200"}
             step="1"
-            value={block.throttlePercent}
-            onInput={(e) => replace({ ...block, throttlePercent: e.currentTarget.valueAsNumber })}
+            value={
+              block.throttleMode === "percent" ? block.throttlePercent : (block.throttlePwm ?? "")
+            }
+            onInput={(e) =>
+              replace(
+                block.throttleMode === "percent"
+                  ? { ...block, throttlePercent: e.currentTarget.valueAsNumber }
+                  : { ...block, throttlePwm: e.currentTarget.valueAsNumber },
+              )
+            }
           />
         </label>
+        <p class="throttle-parameter-note">
+          RCMAP_THROTTLE: RC{throttleChannel} · RC{throttleChannel}_MIN: {minimum ?? "нет данных"}{" "}
+          мкс · RC{throttleChannel}_MAX: {maximum ?? "нет данных"} мкс
+          <br />
+          {targetPwm === undefined
+            ? "Для расчёта подключите контроллер и обновите параметры."
+            : `Целевое значение: ${Math.round(targetPwm)} мкс (${shownPercent.toFixed(1)}%)`}
+        </p>
         <label>
           Набор газа, с
           <input
@@ -726,8 +796,18 @@ function Fields({
             onInput={(e) => replace({ ...block, durationSeconds: e.currentTarget.valueAsNumber })}
           />
         </label>
+        <label class="checkbox-field">
+          <input
+            disabled={disabled}
+            type="checkbox"
+            checked={block.saveRcMaxAfterRun}
+            onChange={(e) => replace({ ...block, saveRcMaxAfterRun: e.currentTarget.checked })}
+          />
+          Сохранить целевое значение в RC{throttleChannel}_MAX после успешного запуска
+        </label>
       </div>
     );
+  }
   if (block.type === "tuneRcMaxByCurrent")
     return (
       <div class="block-fields three-fields">
@@ -1080,9 +1160,9 @@ export function ScenarioEditor({ context }: Props) {
   );
   const [blocks, setBlocks] = useState<ScenarioBlock[]>([]);
   const [page, setPage] = useState<"list" | "editor">("list");
-  const [scenarioSort, setScenarioSort] = useState<"name" | "updatedAt">("name");
+  const [scenarioFilter, setScenarioFilter] = useState<"all" | "active" | "archived">("active");
   const [dirty, setDirty] = useState(false);
-  const [selectedType, setSelectedType] = useState<BlockType>("requireController");
+  const [selectedType, setSelectedType] = useState<BlockType>("wait");
   const [errors, setErrors] = useState<string[]>([]);
   const [entries, setEntries] = useState<RunEntry[]>([]);
   const [status, setStatus] = useState<
@@ -1096,11 +1176,15 @@ export function ScenarioEditor({ context }: Props) {
   const [rotationPrompt, setRotationPrompt] = useState<RotationPrompt | null>(null);
   const stopReason = useRef("Остановлено оператором");
   const running = status === "running";
-  const displayedScenarios = [...savedScenarios].sort((left, right) =>
-    scenarioSort === "updatedAt"
-      ? right.updatedAt - left.updatedAt
-      : left.name.localeCompare(right.name, "ru", { numeric: true, sensitivity: "base" }),
+  const displayedScenarios = savedScenarios.filter(
+    (scenario) =>
+      scenarioFilter === "all" ||
+      (scenarioFilter === "archived" ? scenario.archived : !scenario.archived),
   );
+  const operatorBlockTypes: BlockType[] = ["wait", "sound", "operatorConfirmation"];
+  const canEditBlock = (block: ScenarioBlock) =>
+    operatorBlockTypes.includes(block.type) || block.type === "fullThrottleStandRun";
+  const canToggleBlock = (block: ScenarioBlock) => block.type !== "disarmController";
   const emergencyStop = async (reason = "Остановлено оператором") => {
     stopReason.current = reason;
     cancelled.current = true;
@@ -1144,6 +1228,25 @@ export function ScenarioEditor({ context }: Props) {
     window.addEventListener("keydown", onKeyDown, { capture: true });
     return () => window.removeEventListener("keydown", onKeyDown, { capture: true });
   }, [running]);
+  useEffect(() => {
+    if (page !== "editor") return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isEditing =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement;
+      if (event.key === "Escape" && !running) {
+        event.preventDefault();
+        void backToList();
+      } else if (event.key === "Enter" && !running && !isEditing && !event.repeat) {
+        event.preventDefault();
+        void run();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", onKeyDown, { capture: true });
+  }, [page, running, dirty, blocks, name]);
   useEffect(() => {
     const limit = activeEmergencyCurrentA.current;
     const currentA = Math.abs(context.ammeterPeakA ?? context.ammeterCurrentA ?? 0);
@@ -1205,7 +1308,18 @@ export function ScenarioEditor({ context }: Props) {
     });
     changeDraft();
   };
+  const moveScenario = (scenarioIdToMove: string, offset: number) => {
+    setSavedScenarios((all) => {
+      const index = all.findIndex((scenario) => scenario.id === scenarioIdToMove);
+      const target = index + offset;
+      if (index < 0 || target < 0 || target >= all.length) return all;
+      const next = [...all];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  };
   const add = () => {
+    if (!operatorBlockTypes.includes(selectedType)) return;
     const definition = blockCatalog.find((item) => item.type === selectedType);
     if (definition)
       setBlocks((all) => [...all, definition.create(`${Date.now()}-${Math.random()}`)]);
@@ -1218,17 +1332,6 @@ export function ScenarioEditor({ context }: Props) {
       title: "Несохранённый сценарий",
       kind: "warning",
     }));
-  const createScenario = async () => {
-    if (!(await discardDraftApproved())) return;
-    setScenarioId(crypto.randomUUID());
-    setName("Новый сценарий");
-    setBlocks([]);
-    setEntries([]);
-    setErrors([]);
-    setStatus("idle");
-    setPage("editor");
-    setDirty(true);
-  };
   const selectScenario = async (scenario: SavedScenario) => {
     if (running || !(await discardDraftApproved())) return;
     setScenarioId(scenario.id);
@@ -1249,88 +1352,42 @@ export function ScenarioEditor({ context }: Props) {
       name: name.trim(),
       blocks: structuredClone(blocks),
       updatedAt: Date.now(),
+      archived: savedScenarios.find((item) => item.id === scenarioId)?.archived,
     };
-    setSavedScenarios((all) => [saved, ...all.filter((item) => item.id !== scenarioId)]);
+    setSavedScenarios((all) => {
+      const index = all.findIndex((item) => item.id === scenarioId);
+      if (index < 0) return [...all, saved];
+      const next = [...all];
+      next[index] = saved;
+      return next;
+    });
     setName(saved.name);
     setDirty(false);
   };
-  const deleteScenario = async () => {
+  const archiveScenario = async () => {
     if (
       running ||
-      !(await confirm(`Удалить сценарий «${name}»? Это действие нельзя отменить.`, {
-        title: "Удаление сценария",
-        kind: "warning",
-      }))
+      !(await discardDraftApproved()) ||
+      !(await confirm(
+        `${savedScenarios.find((item) => item.id === scenarioId)?.archived ? "Восстановить" : "Архивировать"} сценарий «${name}»?`,
+        {
+          title: "Сценарий",
+          kind: "warning",
+        },
+      ))
     )
       return;
-    setSavedScenarios((all) => all.filter((item) => item.id !== scenarioId));
+    setSavedScenarios((all) =>
+      all.map((item) =>
+        item.id === scenarioId
+          ? { ...item, archived: !item.archived, updatedAt: Date.now() }
+          : item,
+      ),
+    );
     setPage("list");
     setDirty(false);
     setEntries([]);
     setStatus("idle");
-  };
-  const exportScenario = async () => {
-    const found = validateScenario(name, blocks);
-    setErrors(found);
-    if (found.length) return;
-    try {
-      const safeName = name.trim().replace(/[\\/:*?"<>|]+/g, "-");
-      const path = await save({
-        title: `Экспорт сценария «${name.trim()}»`,
-        defaultPath: `${safeName || "scenario"}.json`,
-        filters: [{ name: "Сценарий UAV Test Station", extensions: ["json"] }],
-      });
-      if (!path) return;
-      const scenario: SavedScenario = {
-        id: scenarioId,
-        name: name.trim(),
-        blocks: structuredClone(blocks),
-        updatedAt: Date.now(),
-      };
-      const file: ScenarioFile = {
-        format: "uav-test-station-scenarios",
-        version: 1,
-        scenarios: [scenario],
-      };
-      await invoke("save_scenario_file", { path, contents: JSON.stringify(file, null, 2) });
-    } catch (error) {
-      window.alert(`Не удалось экспортировать сценарий: ${String(error).replace(/^Error: /, "")}`);
-    }
-  };
-  const importScenarios = async () => {
-    const path = await open({
-      title: "Импорт сценариев",
-      multiple: false,
-      directory: false,
-      filters: [{ name: "Сценарии UAV Test Station", extensions: ["json"] }],
-    });
-    if (!path) return;
-    try {
-      const contents = await invoke<string>("load_scenario_file", { path });
-      const file = JSON.parse(contents) as Partial<ScenarioFile>;
-      if (
-        file.format !== "uav-test-station-scenarios" ||
-        file.version !== 1 ||
-        !Array.isArray(file.scenarios)
-      )
-        throw new Error("Файл не является экспортом сценариев UAV Test Station версии 1");
-      for (const scenario of file.scenarios) {
-        if (
-          !scenario ||
-          typeof scenario.id !== "string" ||
-          typeof scenario.name !== "string" ||
-          !Array.isArray(scenario.blocks) ||
-          validateScenario(scenario.name, scenario.blocks).length
-        )
-          throw new Error(`Некорректный сценарий: ${scenario?.name ?? "без названия"}`);
-      }
-      setSavedScenarios((current) => {
-        const importedIds = new Set(file.scenarios!.map((item) => item.id));
-        return [...file.scenarios!, ...current.filter((item) => !importedIds.has(item.id))];
-      });
-    } catch (error) {
-      window.alert(`Не удалось импортировать сценарии: ${String(error).replace(/^Error: /, "")}`);
-    }
   };
   const backToList = async () => {
     if (running || !(await discardDraftApproved())) return;
@@ -1455,6 +1512,17 @@ export function ScenarioEditor({ context }: Props) {
         await saveReport("cancelled");
         return;
       }
+      if (block.disabled && block.type !== "disarmController") {
+        const skippedEntry: RunEntry = {
+          blockId: block.id,
+          label: blockLabel(block),
+          status: "skipped",
+          message: "Отключён оператором — не выполнялся",
+        };
+        reportEntries.push(skippedEntry);
+        setEntries((all) => [...all, skippedEntry]);
+        continue;
+      }
       const runningEntry =
         precreatedEntries.get(block.id) ??
         ({
@@ -1477,7 +1545,7 @@ export function ScenarioEditor({ context }: Props) {
             const batch: TelemetryCheckBlock[] = [];
             for (let index = blockIndex; index < blocks.length; index += 1) {
               const candidate = blocks[index];
-              if (candidate.type !== "checkTelemetrySignal") break;
+              if (candidate.type !== "checkTelemetrySignal" || candidate.disabled) break;
               batch.push(candidate);
             }
             const additionalEntries = batch.slice(1).map((candidate) => {
@@ -1601,6 +1669,37 @@ export function ScenarioEditor({ context }: Props) {
           if (!latestContext.current.controllerConnected)
             throw new Error("Полётный контроллер не подключён");
 
+          const throttleChannelParameter = await invoke<FreshParameter>(
+            "read_flight_controller_parameter",
+            { name: "RCMAP_THROTTLE" },
+          );
+          const throttleChannel = Math.round(throttleChannelParameter.value);
+          if (throttleChannel < 1 || throttleChannel > 8)
+            throw new Error("RCMAP_THROTTLE содержит недопустимый канал");
+          const minimumParameterName = `RC${throttleChannel}_MIN`;
+          const maximumParameterName = `RC${throttleChannel}_MAX`;
+          const [minimumParameter, maximumParameter] = await Promise.all([
+            invoke<FreshParameter>("read_flight_controller_parameter", {
+              name: minimumParameterName,
+            }),
+            invoke<FreshParameter>("read_flight_controller_parameter", {
+              name: maximumParameterName,
+            }),
+          ]);
+          const minimumPwm = Math.round(minimumParameter.value);
+          const maximumPwm = Math.round(maximumParameter.value);
+          if (minimumPwm >= maximumPwm)
+            throw new Error(`Некорректные ${minimumParameterName}/${maximumParameterName}`);
+          const targetPwm =
+            block.throttleMode === "pwm"
+              ? Math.round(block.throttlePwm ?? Number.NaN)
+              : Math.round(minimumPwm + ((maximumPwm - minimumPwm) * block.throttlePercent) / 100);
+          if (!Number.isFinite(targetPwm) || targetPwm <= minimumPwm || targetPwm > maximumPwm)
+            throw new Error(
+              `Целевой газ должен быть больше ${minimumParameterName} (${minimumPwm} мкс) и не превышать ${maximumParameterName} (${maximumPwm} мкс)`,
+            );
+          const throttlePercent = ((targetPwm - minimumPwm) * 100) / (maximumPwm - minimumPwm);
+
           const motorAccessMessage = await configureFixedWingMotorAccess();
           if (latestContext.current.armed !== true) {
             await invoke("set_flight_controller_armed", { armed: true, force: true });
@@ -1625,19 +1724,19 @@ export function ScenarioEditor({ context }: Props) {
               const stepCount = 3;
               const stepDurationSeconds = block.rampDurationSeconds / stepCount;
               for (let step = 1; step < stepCount; step += 1) {
-                const stepThrottlePercent = Math.max(1, (block.throttlePercent * step) / stepCount);
+                const stepThrottlePercent = Math.max(1, (throttlePercent * step) / stepCount);
                 await invoke<MotorRotationCommand>("start_motor_rotation", {
                   throttlePercent: stepThrottlePercent,
                   durationSeconds: Math.min(5, stepDurationSeconds + 0.2),
                 });
                 updateEntry(block.id, {
-                  message: `Плавный набор: ${stepThrottlePercent.toFixed(0)}% из ${block.throttlePercent}%`,
+                  message: `Плавный набор: ${stepThrottlePercent.toFixed(0)}% из ${throttlePercent.toFixed(1)}%`,
                 });
                 await waitFor(stepDurationSeconds * 1000);
               }
             }
             motorCommand = await invoke<MotorRotationCommand>("start_motor_rotation", {
-              throttlePercent: block.throttlePercent,
+              throttlePercent,
               durationSeconds: block.durationSeconds,
             });
             const startedAt = Date.now();
@@ -1649,7 +1748,9 @@ export function ScenarioEditor({ context }: Props) {
                 latestContext.current.servoOutputPwms?.[motorCommand.motorOutput - 1];
               if (servoOutput !== undefined)
                 maximumServoOutput = Math.max(maximumServoOutput ?? servoOutput, servoOutput);
-              updateEntry(block.id, { message: `${block.throttlePercent}% газа` });
+              updateEntry(block.id, {
+                message: `${targetPwm} мкс (${throttlePercent.toFixed(1)}%) газа`,
+              });
             }
           } finally {
             await invoke("emergency_stop_motor");
@@ -1666,7 +1767,29 @@ export function ScenarioEditor({ context }: Props) {
             block.rampDurationSeconds > 0
               ? `с плавным набором за ${block.rampDurationSeconds.toLocaleString("ru-RU")} с`
               : "резко";
-          message = `Подано ${block.throttlePercent}% газа ${rampMessage}, удержание ${block.durationSeconds.toLocaleString("ru-RU")} с; ${servoMessage}.${motorAccessMessage}`;
+          let savedParameterMessage = "";
+          if (block.saveRcMaxAfterRun && targetPwm !== maximumPwm) {
+            const approved = await confirm(
+              `${maximumParameterName} будет изменён: ${maximumPwm} → ${targetPwm} мкс. Сохранить это значение в полётном контроллере?`,
+              { title: "Сохранение предела газа", kind: "warning" },
+            );
+            if (approved) {
+              await invoke("write_flight_controller_parameters", {
+                requests: [{ name: maximumParameterName, value: targetPwm }],
+              });
+              const verified = await invoke<FreshParameter>("read_flight_controller_parameter", {
+                name: maximumParameterName,
+              });
+              if (Math.abs(verified.value - targetPwm) > 0.5)
+                throw new Error(`Запись ${maximumParameterName} не подтверждена`);
+              savedParameterMessage = ` ${maximumParameterName}: ${maximumPwm} → ${targetPwm} мкс сохранён.`;
+            } else {
+              savedParameterMessage = ` Сохранение ${maximumParameterName} отменено оператором.`;
+            }
+          } else if (block.saveRcMaxAfterRun) {
+            savedParameterMessage = ` ${maximumParameterName} уже равен ${targetPwm} мкс.`;
+          }
+          message = `Подано ${targetPwm} мкс (${throttlePercent.toFixed(1)}%) ${rampMessage}, удержание ${block.durationSeconds.toLocaleString("ru-RU")} с; ${servoMessage}.${motorAccessMessage}${savedParameterMessage}`;
         } else if (block.type === "checkMotorRotation") {
           if (latestContext.current.armed !== true)
             throw new Error("Перед запуском двигателя контроллер должен находиться в ARM");
@@ -2338,56 +2461,79 @@ export function ScenarioEditor({ context }: Props) {
             <h1>Доступные сценарии</h1>
             <p>Выберите сценарий для редактирования и запуска.</p>
           </div>
-          <div class="editor-header-actions">
+          <div class="scenario-list-controls">
+            <UiSelect
+              aria-label="Фильтр сценариев"
+              value={scenarioFilter}
+              onChange={(event) =>
+                setScenarioFilter(event.currentTarget.value as "all" | "active" | "archived")
+              }
+            >
+              <option value="active">Активные</option>
+              <option value="archived">Архивные</option>
+              <option value="all">Все</option>
+            </UiSelect>
             <label>
-              Сортировка
-              <select
-                value={scenarioSort}
-                onChange={(event) =>
-                  setScenarioSort(event.currentTarget.value as "name" | "updatedAt")
-                }
-              >
-                <option value="name">По названию</option>
-                <option value="updatedAt">Сначала изменённые</option>
-              </select>
+              <span>Серийный номер устройства</span>
+              <UiInput
+                value={serialNumber}
+                placeholder="Например, UAV-001"
+                onInput={(event) => setSerialNumber(event.currentTarget.value)}
+              />
             </label>
-            <button type="button" onClick={importScenarios}>
-              Импорт
-            </button>
-            <button type="button" class="primary-button" onClick={createScenario}>
-              + Добавить сценарий
-            </button>
           </div>
         </section>
-        <section class="scenario-global-settings">
-          <label>
-            <span>Серийный номер устройства</span>
-            <input
-              value={serialNumber}
-              placeholder="Необязательно, например UAV-001"
-              onInput={(event) => setSerialNumber(event.currentTarget.value)}
-            />
-          </label>
-          <p>Будет добавлен в отчёт при запуске любого сценария. Поле можно оставить пустым.</p>
-        </section>
         <section class="scenario-list-page">
-          {displayedScenarios.map((scenario) => (
-            <button type="button" class="scenario-card" onClick={() => selectScenario(scenario)}>
-              <div>
-                <strong>{scenario.name}</strong>
-                <span>{scenario.blocks.length} блоков</span>
-              </div>
-              <time>Изменён {new Date(scenario.updatedAt).toLocaleString()}</time>
-              <span class="scenario-card-arrow">→</span>
-            </button>
-          ))}
-          {!savedScenarios.length && (
+          {displayedScenarios.map((scenario) => {
+            const index = savedScenarios.findIndex((item) => item.id === scenario.id);
+            return (
+              <article class={`scenario-card ${scenario.archived ? "archived" : ""}`}>
+                <button
+                  type="button"
+                  class="scenario-card-main"
+                  onClick={() => selectScenario(scenario)}
+                >
+                  <div>
+                    <strong>{scenario.name}</strong>
+                    <span>
+                      {scenario.blocks.length} блоков{scenario.archived ? " · В архиве" : ""}
+                    </span>
+                  </div>
+                  <time>Изменён {new Date(scenario.updatedAt).toLocaleString()}</time>
+                  <span class="scenario-card-arrow">→</span>
+                </button>
+                <div
+                  class="scenario-order-actions"
+                  aria-label={`Порядок сценария ${scenario.name}`}
+                >
+                  <button
+                    type="button"
+                    disabled={index === 0}
+                    onClick={() => moveScenario(scenario.id, -1)}
+                  >
+                    ↑
+                  </button>
+                  <button
+                    type="button"
+                    disabled={index === savedScenarios.length - 1}
+                    onClick={() => moveScenario(scenario.id, 1)}
+                  >
+                    ↓
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+          {!displayedScenarios.length && (
             <div class="scenario-empty">
-              <h2>Сценариев пока нет</h2>
-              <p>Создайте первый сценарий и добавьте в него нужные блоки.</p>
-              <button type="button" onClick={createScenario}>
-                Добавить сценарий
-              </button>
+              <h2>
+                {savedScenarios.length ? "Нет сценариев в выбранном фильтре" : "Сценариев пока нет"}
+              </h2>
+              <p>
+                {savedScenarios.length
+                  ? "Измените фильтр, чтобы увидеть другие сценарии."
+                  : "Сценарии добавляются разработчиком вместе с приложением."}
+              </p>
             </div>
           )}
         </section>
@@ -2411,11 +2557,10 @@ export function ScenarioEditor({ context }: Props) {
           <button type="button" onClick={saveScenario} disabled={running}>
             Сохранить
           </button>
-          <button type="button" onClick={exportScenario} disabled={running}>
-            Экспорт
-          </button>
-          <button type="button" class="danger-button" onClick={deleteScenario} disabled={running}>
-            Удалить
+          <button type="button" onClick={archiveScenario} disabled={running}>
+            {savedScenarios.find((item) => item.id === scenarioId)?.archived
+              ? "Восстановить"
+              : "Архивировать"}
           </button>
           {running ? (
             <button type="button" class="danger-button" onClick={() => void emergencyStop()}>
@@ -2430,26 +2575,21 @@ export function ScenarioEditor({ context }: Props) {
       </section>
       <section class="scenario-edit-page">
         <div class="scenario-editor">
-          <label class="scenario-name">
+          <div class="scenario-name">
             <span>Название сценария</span>
-            <input
-              value={name}
-              disabled={running}
-              onInput={(e) => {
-                setName(e.currentTarget.value);
-                changeDraft();
-              }}
-            />
-          </label>
+            <strong>{name}</strong>
+          </div>
           <div class="block-adder">
             <select
               value={selectedType}
               disabled={running}
               onChange={(e) => setSelectedType(e.currentTarget.value as BlockType)}
             >
-              {blockCatalog.map((item) => (
-                <option value={item.type}>{item.label}</option>
-              ))}
+              {blockCatalog
+                .filter((item) => operatorBlockTypes.includes(item.type))
+                .map((item) => (
+                  <option value={item.type}>{item.label}</option>
+                ))}
             </select>
             <button type="button" onClick={add} disabled={running}>
               Добавить блок
@@ -2461,7 +2601,10 @@ export function ScenarioEditor({ context }: Props) {
           <div class="scenario-blocks">
             {blocks.length ? (
               blocks.map((block, index) => (
-                <article class="scenario-block" key={block.id}>
+                <article
+                  class={`scenario-block ${block.disabled ? "disabled" : ""}`}
+                  key={block.id}
+                >
                   <div class="scenario-block-heading">
                     <span class="block-number">{index + 1}</span>
                     <div>
@@ -2471,32 +2614,42 @@ export function ScenarioEditor({ context }: Props) {
                     <div class="block-actions">
                       <button
                         type="button"
-                        disabled={index === 0 || running}
+                        disabled={index === 0 || running || !canEditBlock(block)}
                         onClick={() => move(index, -1)}
                       >
                         ↑
                       </button>
                       <button
                         type="button"
-                        disabled={index === blocks.length - 1 || running}
+                        disabled={index === blocks.length - 1 || running || !canEditBlock(block)}
                         onClick={() => move(index, 1)}
                       >
                         ↓
                       </button>
                       <button
                         type="button"
-                        class="danger-button"
-                        disabled={running}
+                        class={block.disabled ? "primary-button" : ""}
+                        disabled={running || !canToggleBlock(block)}
+                        title={
+                          canToggleBlock(block)
+                            ? undefined
+                            : "DISARM обязателен для безопасного завершения сценария"
+                        }
                         onClick={() => {
-                          setBlocks((all) => all.filter((item) => item.id !== block.id));
+                          replace({ ...block, disabled: !block.disabled });
                           changeDraft();
                         }}
                       >
-                        Удалить
+                        {block.disabled ? "Включить" : "Отключить"}
                       </button>
                     </div>
                   </div>
-                  <Fields block={block} replace={replace} disabled={running} />
+                  <Fields
+                    block={block}
+                    replace={replace}
+                    context={context}
+                    disabled={running || block.disabled || !canEditBlock(block)}
+                  />
                 </article>
               ))
             ) : (
@@ -2524,7 +2677,9 @@ export function ScenarioEditor({ context }: Props) {
                       ? "!"
                       : entry.status === "failed"
                         ? "×"
-                        : "…"}
+                        : entry.status === "skipped"
+                          ? "—"
+                          : "…"}
                 </span>
                 <div>
                   <strong>{entry.label}</strong>
