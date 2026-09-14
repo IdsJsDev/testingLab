@@ -223,7 +223,8 @@ const motorTestTemplates: SavedScenario[] = [
         type: "fullThrottleStandRun",
         throttlePercent: 100,
         throttleMode: "percent",
-        saveRcMaxAfterRun: false,
+        pwmTarget: "servo",
+        saveServoMaxAfterRun: false,
         rampDurationSeconds: 1,
         durationSeconds: 0.5,
       },
@@ -244,7 +245,14 @@ function loadScenarios(): SavedScenario[] {
               ? {
                   ...block,
                   throttleMode: block.throttleMode ?? "percent",
-                  saveRcMaxAfterRun: block.saveRcMaxAfterRun ?? false,
+                  // Old PWM scenarios stored PWM as an RC input. Preserve that
+                  // interpretation so they cannot command an unintended ESC
+                  // output after this change.
+                  pwmTarget: block.pwmTarget ?? (block.throttleMode === "pwm" ? "rc" : "servo"),
+                  saveServoMaxAfterRun:
+                    block.saveServoMaxAfterRun ??
+                    (block as unknown as { saveRcMaxAfterRun?: boolean }).saveRcMaxAfterRun ??
+                    false,
                 }
               : block.type === "disarmController"
                 ? { ...block, disabled: false }
@@ -717,16 +725,52 @@ function Fields({
       Number.isFinite(minimum) &&
       Number.isFinite(maximum) &&
       minimum < maximum;
-    const targetPwm =
+    const motorOutput = Array.from({ length: 8 }, (_, index) => index + 1).find(
+      (output) =>
+        Math.round(
+          context.parameters.find((parameter) => parameter.name === `SERVO${output}_FUNCTION`)
+            ?.value ?? Number.NaN,
+        ) === 70,
+    );
+    const servoMinimum = motorOutput
+      ? context.parameters.find((parameter) => parameter.name === `SERVO${motorOutput}_MIN`)?.value
+      : undefined;
+    const servoMaximum = motorOutput
+      ? context.parameters.find((parameter) => parameter.name === `SERVO${motorOutput}_MAX`)?.value
+      : undefined;
+    const hasServoRange =
+      servoMinimum !== undefined &&
+      servoMaximum !== undefined &&
+      Number.isFinite(servoMinimum) &&
+      Number.isFinite(servoMaximum) &&
+      servoMinimum < servoMaximum;
+    const pwmTargetsServo = block.pwmTarget !== "rc";
+    const legacyRcPwm =
+      block.throttleMode === "pwm" && !pwmTargetsServo ? block.throttlePwm : undefined;
+    const targetServoPwm =
       block.throttleMode === "pwm"
-        ? block.throttlePwm
-        : hasRange
-          ? Math.round(minimum + ((maximum - minimum) * block.throttlePercent) / 100)
+        ? pwmTargetsServo
+          ? block.throttlePwm
+          : hasServoRange && hasRange && legacyRcPwm !== undefined
+            ? Math.round(
+                servoMinimum +
+                  ((servoMaximum - servoMinimum) * (legacyRcPwm - minimum)) / (maximum - minimum),
+              )
+            : undefined
+        : hasServoRange
+          ? Math.round(servoMinimum + ((servoMaximum - servoMinimum) * block.throttlePercent) / 100)
           : undefined;
     const shownPercent =
-      hasRange && targetPwm !== undefined
-        ? ((targetPwm - minimum) / (maximum - minimum)) * 100
-        : block.throttlePercent;
+      legacyRcPwm !== undefined && hasRange
+        ? ((legacyRcPwm - minimum) / (maximum - minimum)) * 100
+        : hasServoRange && targetServoPwm !== undefined
+          ? ((targetServoPwm - servoMinimum) / (servoMaximum - servoMinimum)) * 100
+          : block.throttlePercent;
+    const targetPwm =
+      legacyRcPwm ??
+      (hasRange && Number.isFinite(shownPercent)
+        ? Math.round(minimum + ((maximum - minimum) * shownPercent) / 100)
+        : undefined);
     return (
       <div class="block-fields three-fields">
         <label>
@@ -739,11 +783,15 @@ function Fields({
             }
           >
             <option value="percent">Проценты</option>
-            <option value="pwm">Микросекунды</option>
+            <option value="pwm">Выход SERVO, мкс</option>
           </select>
         </label>
         <label>
-          {block.throttleMode === "percent" ? "Газ, %" : "Газ, мкс"}
+          {block.throttleMode === "percent"
+            ? "Газ, %"
+            : pwmTargetsServo
+              ? `Выход SERVO${motorOutput ?? 1}, мкс`
+              : `Устаревшая команда RC${throttleChannel}, мкс`}
           <input
             disabled={disabled}
             type="number"
@@ -763,12 +811,14 @@ function Fields({
           />
         </label>
         <p class="throttle-parameter-note">
+          {targetServoPwm === undefined || !motorOutput
+            ? "Для расчёта выхода ESC подключите контроллер и обновите параметры."
+            : `Целевой выход SERVO${motorOutput}: ${targetServoPwm} мкс (${shownPercent.toFixed(1)}%)`}
+          <br />
           RCMAP_THROTTLE: RC{throttleChannel} · RC{throttleChannel}_MIN: {minimum ?? "нет данных"}{" "}
           мкс · RC{throttleChannel}_MAX: {maximum ?? "нет данных"} мкс
           <br />
-          {targetPwm === undefined
-            ? "Для расчёта подключите контроллер и обновите параметры."
-            : `Целевое значение: ${Math.round(targetPwm)} мкс (${shownPercent.toFixed(1)}%)`}
+          {targetPwm !== undefined && `Команда RC${throttleChannel}: ${Math.round(targetPwm)} мкс`}
         </p>
         <label>
           Набор газа, с
@@ -800,10 +850,10 @@ function Fields({
           <input
             disabled={disabled}
             type="checkbox"
-            checked={block.saveRcMaxAfterRun}
-            onChange={(e) => replace({ ...block, saveRcMaxAfterRun: e.currentTarget.checked })}
+            checked={block.saveServoMaxAfterRun}
+            onChange={(e) => replace({ ...block, saveServoMaxAfterRun: e.currentTarget.checked })}
           />
-          Сохранить целевое значение в RC{throttleChannel}_MAX после успешного запуска
+          Сохранить целевое значение в SERVO{motorOutput ?? 1}_MAX после успешного запуска
         </label>
       </div>
     );
@@ -1678,27 +1728,87 @@ export function ScenarioEditor({ context }: Props) {
             throw new Error("RCMAP_THROTTLE содержит недопустимый канал");
           const minimumParameterName = `RC${throttleChannel}_MIN`;
           const maximumParameterName = `RC${throttleChannel}_MAX`;
-          const [minimumParameter, maximumParameter] = await Promise.all([
-            invoke<FreshParameter>("read_flight_controller_parameter", {
-              name: minimumParameterName,
-            }),
-            invoke<FreshParameter>("read_flight_controller_parameter", {
-              name: maximumParameterName,
-            }),
-          ]);
+          // The MAVLink worker performs one point parameter read at a time.
+          // Do not use Promise.all here: the second request would otherwise
+          // be rejected while the first response is still pending.
+          const minimumParameter = await invoke<FreshParameter>(
+            "read_flight_controller_parameter",
+            { name: minimumParameterName },
+          );
+          const maximumParameter = await invoke<FreshParameter>(
+            "read_flight_controller_parameter",
+            { name: maximumParameterName },
+          );
           const minimumPwm = Math.round(minimumParameter.value);
           const maximumPwm = Math.round(maximumParameter.value);
           if (minimumPwm >= maximumPwm)
             throw new Error(`Некорректные ${minimumParameterName}/${maximumParameterName}`);
-          const targetPwm =
-            block.throttleMode === "pwm"
-              ? Math.round(block.throttlePwm ?? Number.NaN)
-              : Math.round(minimumPwm + ((maximumPwm - minimumPwm) * block.throttlePercent) / 100);
-          if (!Number.isFinite(targetPwm) || targetPwm <= minimumPwm || targetPwm > maximumPwm)
+          const motorOutput = Array.from({ length: 8 }, (_, index) => index + 1).find(
+            (output) =>
+              Math.round(
+                latestContext.current.parameters.find(
+                  (parameter) => parameter.name === `SERVO${output}_FUNCTION`,
+                )?.value ?? Number.NaN,
+              ) === 70,
+          );
+          if (!motorOutput)
             throw new Error(
-              `Целевой газ должен быть больше ${minimumParameterName} (${minimumPwm} мкс) и не превышать ${maximumParameterName} (${maximumPwm} мкс)`,
+              "Не найден выход двигателя: обновите параметры и задайте SERVOx_FUNCTION = 70 (Throttle)",
             );
-          const throttlePercent = ((targetPwm - minimumPwm) * 100) / (maximumPwm - minimumPwm);
+          const servoMinimumParameterName = `SERVO${motorOutput}_MIN`;
+          const servoMaximumParameterName = `SERVO${motorOutput}_MAX`;
+          const servoMinimumParameter = await invoke<FreshParameter>(
+            "read_flight_controller_parameter",
+            { name: servoMinimumParameterName },
+          );
+          const servoMaximumParameter = await invoke<FreshParameter>(
+            "read_flight_controller_parameter",
+            { name: servoMaximumParameterName },
+          );
+          const servoMinimumPwm = Math.round(servoMinimumParameter.value);
+          const servoMaximumPwm = Math.round(servoMaximumParameter.value);
+          if (servoMinimumPwm >= servoMaximumPwm)
+            throw new Error(
+              `Некорректные ${servoMinimumParameterName}/${servoMaximumParameterName}`,
+            );
+          const pwmTargetsServo = block.pwmTarget !== "rc";
+          const legacyRcPwm =
+            block.throttleMode === "pwm" && !pwmTargetsServo
+              ? Math.round(block.throttlePwm ?? Number.NaN)
+              : undefined;
+          if (
+            legacyRcPwm !== undefined &&
+            (!Number.isFinite(legacyRcPwm) || legacyRcPwm <= minimumPwm || legacyRcPwm > maximumPwm)
+          )
+            throw new Error(
+              `Устаревшая команда RC должна быть больше ${minimumParameterName} (${minimumPwm} мкс) и не превышать ${maximumParameterName} (${maximumPwm} мкс)`,
+            );
+          const targetServoPwm =
+            legacyRcPwm !== undefined
+              ? Math.round(
+                  servoMinimumPwm +
+                    ((servoMaximumPwm - servoMinimumPwm) * (legacyRcPwm - minimumPwm)) /
+                      (maximumPwm - minimumPwm),
+                )
+              : block.throttleMode === "pwm"
+                ? Math.round(block.throttlePwm ?? Number.NaN)
+                : Math.round(
+                    servoMinimumPwm +
+                      ((servoMaximumPwm - servoMinimumPwm) * block.throttlePercent) / 100,
+                  );
+          if (
+            !Number.isFinite(targetServoPwm) ||
+            targetServoPwm <= servoMinimumPwm ||
+            targetServoPwm > servoMaximumPwm
+          )
+            throw new Error(
+              `Целевой выход должен быть больше ${servoMinimumParameterName} (${servoMinimumPwm} мкс) и не превышать ${servoMaximumParameterName} (${servoMaximumPwm} мкс)`,
+            );
+          const throttlePercent =
+            ((targetServoPwm - servoMinimumPwm) * 100) / (servoMaximumPwm - servoMinimumPwm);
+          const targetPwm =
+            legacyRcPwm ??
+            Math.round(minimumPwm + ((maximumPwm - minimumPwm) * throttlePercent) / 100);
 
           const motorAccessMessage = await configureFixedWingMotorAccess();
           if (latestContext.current.armed !== true) {
@@ -1761,35 +1871,35 @@ export function ScenarioEditor({ context }: Props) {
           if (!motorCommand) throw new Error("Не удалось отправить команду полного газа");
           const servoMessage =
             maximumServoOutput === undefined
-              ? `выход SERVO${motorCommand.motorOutput} не получен в телеметрии`
-              : `SERVO${motorCommand.motorOutput} достиг ${maximumServoOutput} мкс при цели около ${motorCommand.expectedServo1Pwm} мкс`;
+              ? `SERVO${motorCommand.motorOutput}: нет данных телеметрии; ожидается около ${motorCommand.expectedServo1Pwm} мкс`
+              : `SERVO${motorCommand.motorOutput}: ${maximumServoOutput} мкс (цель около ${motorCommand.expectedServo1Pwm} мкс)`;
           const rampMessage =
             block.rampDurationSeconds > 0
               ? `с плавным набором за ${block.rampDurationSeconds.toLocaleString("ru-RU")} с`
               : "резко";
           let savedParameterMessage = "";
-          if (block.saveRcMaxAfterRun && targetPwm !== maximumPwm) {
+          if (block.saveServoMaxAfterRun && targetServoPwm !== servoMaximumPwm) {
             const approved = await confirm(
-              `${maximumParameterName} будет изменён: ${maximumPwm} → ${targetPwm} мкс. Сохранить это значение в полётном контроллере?`,
+              `${servoMaximumParameterName} будет изменён: ${servoMaximumPwm} → ${targetServoPwm} мкс. Сохранить это значение в полётном контроллере?`,
               { title: "Сохранение предела газа", kind: "warning" },
             );
             if (approved) {
               await invoke("write_flight_controller_parameters", {
-                requests: [{ name: maximumParameterName, value: targetPwm }],
+                requests: [{ name: servoMaximumParameterName, value: targetServoPwm }],
               });
               const verified = await invoke<FreshParameter>("read_flight_controller_parameter", {
-                name: maximumParameterName,
+                name: servoMaximumParameterName,
               });
-              if (Math.abs(verified.value - targetPwm) > 0.5)
-                throw new Error(`Запись ${maximumParameterName} не подтверждена`);
-              savedParameterMessage = ` ${maximumParameterName}: ${maximumPwm} → ${targetPwm} мкс сохранён.`;
+              if (Math.abs(verified.value - targetServoPwm) > 0.5)
+                throw new Error(`Запись ${servoMaximumParameterName} не подтверждена`);
+              savedParameterMessage = ` ${servoMaximumParameterName}: ${servoMaximumPwm} → ${targetServoPwm} мкс сохранён.`;
             } else {
-              savedParameterMessage = ` Сохранение ${maximumParameterName} отменено оператором.`;
+              savedParameterMessage = ` Сохранение ${servoMaximumParameterName} отменено оператором.`;
             }
-          } else if (block.saveRcMaxAfterRun) {
-            savedParameterMessage = ` ${maximumParameterName} уже равен ${targetPwm} мкс.`;
+          } else if (block.saveServoMaxAfterRun) {
+            savedParameterMessage = ` ${servoMaximumParameterName} уже равен ${targetServoPwm} мкс.`;
           }
-          message = `Подано ${targetPwm} мкс (${throttlePercent.toFixed(1)}%) ${rampMessage}, удержание ${block.durationSeconds.toLocaleString("ru-RU")} с; ${servoMessage}.${motorAccessMessage}${savedParameterMessage}`;
+          message = `${servoMessage}; ${rampMessage}, удержание ${block.durationSeconds.toLocaleString("ru-RU")} с. Команда RC${throttleChannel}: ${targetPwm} мкс (${throttlePercent.toFixed(1)}%).${motorAccessMessage}${savedParameterMessage}`;
         } else if (block.type === "checkMotorRotation") {
           if (latestContext.current.armed !== true)
             throw new Error("Перед запуском двигателя контроллер должен находиться в ARM");

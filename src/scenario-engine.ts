@@ -205,7 +205,8 @@ export type ScenarioBlock = (
       throttlePercent: number;
       throttleMode: "percent" | "pwm";
       throttlePwm?: number;
-      saveRcMaxAfterRun: boolean;
+      pwmTarget?: "rc" | "servo";
+      saveServoMaxAfterRun: boolean;
       rampDurationSeconds: number;
       durationSeconds: number;
     }
@@ -412,7 +413,8 @@ export const blockCatalog: BlockDefinition[] = [
       type: "fullThrottleStandRun",
       throttlePercent: 100,
       throttleMode: "percent",
-      saveRcMaxAfterRun: false,
+      pwmTarget: "servo",
+      saveServoMaxAfterRun: false,
       rampDurationSeconds: 1,
       durationSeconds: 0.5,
     }),

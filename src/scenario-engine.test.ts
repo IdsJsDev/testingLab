@@ -116,7 +116,7 @@ describe("scenario validation", () => {
       type: "fullThrottleStandRun" as const,
       throttlePercent: 100,
       throttleMode: "percent" as const,
-      saveRcMaxAfterRun: false,
+      saveServoMaxAfterRun: false,
       rampDurationSeconds: 1,
       durationSeconds: 0.5,
     };
