@@ -1909,7 +1909,9 @@ export function ScenarioEditor({ context }: Props) {
             savedParameterMessage = ` ${servoMaximumParameterName} уже равен ${targetServoPwm} мкс.`;
           }
           const average = (samples: number[]) =>
-            samples.length ? samples.reduce((sum, value) => sum + value, 0) / samples.length : undefined;
+            samples.length
+              ? samples.reduce((sum, value) => sum + value, 0) / samples.length
+              : undefined;
           const averageCurrentA = average(ammeterAverageCurrentSamples);
           const averageInstantaneousCurrentA = average(ammeterInstantaneousCurrentSamples);
           const peakCurrentA = ammeterInstantaneousCurrentSamples.length
