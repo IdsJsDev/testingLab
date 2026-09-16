@@ -1824,6 +1824,8 @@ export function ScenarioEditor({ context }: Props) {
 
           let maximumServoOutput: number | undefined;
           let motorCommand: MotorRotationCommand | undefined;
+          const ammeterAverageCurrentSamples: number[] = [];
+          const ammeterInstantaneousCurrentSamples: number[] = [];
           motorActive.current = true;
           activeEmergencyCurrentA.current = null;
           try {
@@ -1858,6 +1860,13 @@ export function ScenarioEditor({ context }: Props) {
                 latestContext.current.servoOutputPwms?.[motorCommand.motorOutput - 1];
               if (servoOutput !== undefined)
                 maximumServoOutput = Math.max(maximumServoOutput ?? servoOutput, servoOutput);
+              if (latestContext.current.ammeterConnected) {
+                const { ammeterCurrentA, ammeterInstantaneousA } = latestContext.current;
+                if (ammeterCurrentA !== undefined && Number.isFinite(ammeterCurrentA))
+                  ammeterAverageCurrentSamples.push(ammeterCurrentA);
+                if (ammeterInstantaneousA !== undefined && Number.isFinite(ammeterInstantaneousA))
+                  ammeterInstantaneousCurrentSamples.push(ammeterInstantaneousA);
+              }
               updateEntry(block.id, {
                 message: `${targetPwm} мкс (${throttlePercent.toFixed(1)}%) газа`,
               });
@@ -1899,7 +1908,22 @@ export function ScenarioEditor({ context }: Props) {
           } else if (block.saveServoMaxAfterRun) {
             savedParameterMessage = ` ${servoMaximumParameterName} уже равен ${targetServoPwm} мкс.`;
           }
-          message = `${servoMessage}; ${rampMessage}, удержание ${block.durationSeconds.toLocaleString("ru-RU")} с. Команда RC${throttleChannel}: ${targetPwm} мкс (${throttlePercent.toFixed(1)}%).${motorAccessMessage}${savedParameterMessage}`;
+          const average = (samples: number[]) =>
+            samples.length ? samples.reduce((sum, value) => sum + value, 0) / samples.length : undefined;
+          const averageCurrentA = average(ammeterAverageCurrentSamples);
+          const averageInstantaneousCurrentA = average(ammeterInstantaneousCurrentSamples);
+          const peakCurrentA = ammeterInstantaneousCurrentSamples.length
+            ? Math.max(...ammeterInstantaneousCurrentSamples)
+            : undefined;
+          const ammeterMessage =
+            averageCurrentA !== undefined ||
+            averageInstantaneousCurrentA !== undefined ||
+            peakCurrentA !== undefined
+              ? ` Амперметр за время полного газа: средний по «среднему току» ${averageCurrentA?.toFixed(3) ?? "—"} A; средний по мгновенному току ${averageInstantaneousCurrentA?.toFixed(3) ?? "—"} A; пик мгновенного тока за всё время ${peakCurrentA?.toFixed(3) ?? "—"} A.`
+              : latestContext.current.ammeterConnected
+                ? " Амперметр подключён, но показания тока не получены."
+                : " Амперметр не подключён — ток не записывался.";
+          message = `${servoMessage}; ${rampMessage}, удержание ${block.durationSeconds.toLocaleString("ru-RU")} с. Команда RC${throttleChannel}: ${targetPwm} мкс (${throttlePercent.toFixed(1)}%).${motorAccessMessage}${savedParameterMessage}${ammeterMessage}`;
         } else if (block.type === "checkMotorRotation") {
           if (latestContext.current.armed !== true)
             throw new Error("Перед запуском двигателя контроллер должен находиться в ARM");
